@@ -131,6 +131,14 @@ function getPlayerName() {
 
 // ─── Message Hiding (Ghosting) ───────────────────────────────────────
 
+/**
+ * Ghost a message: mark it for context exclusion.
+ * We ONLY set extra.sc_ghosted (persistent tracking + CSS visual).
+ * The actual context exclusion happens in the generation interceptor
+ * using Symbol.for('ignore') on structuredClone'd messages.
+ *
+ * We never touch is_system, is_hidden, or any other ST rendering flag.
+ */
 function ghostMessage(messageIndex) {
     const { chat } = SillyTavern.getContext();
     const msg = chat[messageIndex];
@@ -138,10 +146,8 @@ function ghostMessage(messageIndex) {
     if (!msg.extra) msg.extra = {};
     if (msg.extra.sc_ghosted) return;
 
-    // Persistent tracking flag only — no is_hidden here
     msg.extra.sc_ghosted = true;
 
-    // Visual indicator
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageIndex}"]`);
     if (messageElement) {
         messageElement.classList.add('sc-ghosted');
@@ -154,11 +160,7 @@ function unghostMessage(messageIndex) {
     const { chat } = SillyTavern.getContext();
     const msg = chat[messageIndex];
     if (!msg) return;
-
     if (msg.extra) delete msg.extra.sc_ghosted;
-
-    // Clean up is_hidden in case it was set by generation interceptor
-    delete msg.is_hidden;
 
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageIndex}"]`);
     if (messageElement) {
@@ -186,8 +188,6 @@ function applyGhostVisuals() {
         if (!chat) return;
         for (let i = 0; i < chat.length; i++) {
             const isGhosted = chat[i]?.extra?.sc_ghosted === true;
-
-            // DO NOT set is_hidden here — only visual CSS class
             const messageElement = document.querySelector(`#chat .mes[mesid="${i}"]`);
             if (!messageElement) continue;
             if (isGhosted) {
@@ -219,15 +219,17 @@ function setupGhostObserver() {
             applyGhostVisuals();
         }
     });
-    observer.observe(chatContainer, {
-        childList: true,
-        subtree: false,
-    });
+    observer.observe(chatContainer, { childList: true, subtree: false });
     log('Ghost visual observer attached to #chat');
 }
 
 // ─── Generation Interceptor ─────────────────────────────────────────
 
+/**
+ * The OFFICIAL way to exclude messages from context (PR #3763).
+ * Uses Symbol.for('ignore') on structuredClone'd messages.
+ * The symbol never persists to JSON, never affects rendering.
+ */
 function setupGenerationInterceptor() {
     const { eventSource, event_types } = SillyTavern.getContext();
 
@@ -239,43 +241,25 @@ function setupGenerationInterceptor() {
 
         const { chat } = SillyTavern.getContext();
 
+        // Get the ignore symbol — either from ST context or create it
+        let IGNORE_SYMBOL;
+        try {
+            const ctx = SillyTavern.getContext();
+            IGNORE_SYMBOL = ctx.symbols?.IGNORE || Symbol.for('ignore');
+        } catch (e) {
+            IGNORE_SYMBOL = Symbol.for('ignore');
+        }
+
         for (let i = 0; i < chat.length; i++) {
-            const msg = chat[i];
-            if (msg?.extra?.sc_ghosted) {
-                // Set is_hidden RIGHT before generation — this excludes from context
-                msg.is_hidden = true;
+            if (chat[i]?.extra?.sc_ghosted) {
+                // structuredClone to avoid persisting the symbol
+                chat[i] = structuredClone(chat[i]);
+                if (!chat[i].extra) chat[i].extra = {};
+                chat[i].extra[IGNORE_SYMBOL] = true;
             }
         }
 
-        log('Generation interceptor: applied is_hidden to ghosted messages');
-    });
-
-    // Clean up is_hidden AFTER generation so it doesn't persist to disk
-    eventSource.on(event_types.GENERATION_ENDED, () => {
-        const { chat } = SillyTavern.getContext();
-        if (!chat) return;
-
-        for (let i = 0; i < chat.length; i++) {
-            const msg = chat[i];
-            if (msg?.extra?.sc_ghosted && msg.is_hidden) {
-                delete msg.is_hidden;
-            }
-        }
-
-        log('Generation interceptor: cleaned up is_hidden flags');
-    });
-
-    // Also clean up on generation stopped/aborted
-    eventSource.on(event_types.GENERATION_STOPPED, () => {
-        const { chat } = SillyTavern.getContext();
-        if (!chat) return;
-
-        for (let i = 0; i < chat.length; i++) {
-            const msg = chat[i];
-            if (msg?.extra?.sc_ghosted && msg.is_hidden) {
-                delete msg.is_hidden;
-            }
-        }
+        log('Generation interceptor: applied ignore symbol to ghosted messages');
     });
 }
 
