@@ -596,6 +596,12 @@ async function summarizeOneBatch(visibleTurns) {
             return false;
         }
 
+        // ─── SAVE SNIPPET FIRST ───
+        // Critical: persist the snippet to metadata BEFORE ghosting.
+        // If the page reloads between saving and ghosting, worst case
+        // is a snippet exists for non-ghosted messages (harmless).
+        // The old order (ghost first) meant a reload could lose the
+        // snippet while messages were already hidden (data loss).
         store.layers[0].push({
             text: summary,
             turnRange: [startIdx, endIdx],
@@ -603,11 +609,18 @@ async function summarizeOneBatch(visibleTurns) {
         });
 
         store.summarizedUpTo = Math.max(store.summarizedUpTo, endIdx);
+
+        // Save metadata IMMEDIATELY — snippet is now persisted
+        await saveChatStore();
+
+        // NOW ghost the messages (safe — snippet is already saved)
         await ghostMessagesUpTo(endIdx);
 
         log(`Layer 0 now has ${store.layers[0].length} snippets`);
 
         await maybePromoteLayer(0);
+
+        // Save again after potential promotion
         await saveChatStore();
 
         try {
@@ -653,6 +666,7 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
         return false;
     }
 
+    // ─── SAVE SNIPPET FIRST ───
     store.layers[0].push({
         text: summary,
         turnRange: [startIdx, endIdx],
@@ -660,9 +674,16 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
     });
 
     store.summarizedUpTo = Math.max(store.summarizedUpTo, endIdx);
+
+    // Persist snippet BEFORE ghosting
+    await saveChatStore();
+
+    // NOW ghost (safe — snippet is persisted)
     await ghostMessagesUpTo(endIdx);
 
     await maybePromoteLayer(0);
+
+    // Save again after potential promotion
     await saveChatStore();
 
     try {
