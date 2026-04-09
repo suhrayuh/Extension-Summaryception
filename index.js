@@ -977,10 +977,15 @@ function registerSlashCommands() {
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'sc-clear',
             callback: async () => {
-                const store = getChatStore();
                 await unghostAllMessages();
-                store.layers = [];
+
+                const store = getChatStore();
+                store.layers.length = 0;
                 store.summarizedUpTo = -1;
+
+                const { chatMetadata } = SillyTavern.getContext();
+                chatMetadata[MODULE_NAME] = store;
+
                 await saveChatStore();
                 try {
                     const ctx2 = SillyTavern.getContext();
@@ -1104,6 +1109,18 @@ function updateSnippetBrowser() {
         const layer = store.layers[layerIdx];
         if (layer) {
             layer.splice(snippetIdx, 1);
+
+            // Recalculate summarizedUpTo from remaining Layer 0 snippets
+            const store2 = getChatStore();
+            if (store2.layers[0] && store2.layers[0].length > 0) {
+                const maxEnd = Math.max(...store2.layers[0]
+                .filter(sn => sn.turnRange)
+                .map(sn => sn.turnRange[1]));
+                store2.summarizedUpTo = maxEnd;
+            } else {
+                store2.summarizedUpTo = -1;
+            }
+
             await saveChatStore();
             updateInjection();
             updateUI();
@@ -1169,10 +1186,19 @@ function bindUIEvents() {
 
     $('#sc_clear_memory').on('click', async function () {
         if (!confirm('Clear ALL Summaryception memory for this chat and unghost all messages?')) return;
-        const store = getChatStore();
+
+        // Unghost first
         await unghostAllMessages();
-        store.layers = [];
+
+        // Clear the store by modifying in place, not reassigning
+        const store = getChatStore();
+        store.layers.length = 0;
         store.summarizedUpTo = -1;
+
+        // Force save metadata
+        const { chatMetadata } = SillyTavern.getContext();
+        chatMetadata[MODULE_NAME] = store;
+
         await saveChatStore();
         try {
             const ctx = SillyTavern.getContext();
