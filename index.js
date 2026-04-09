@@ -1,14 +1,9 @@
 /**
- * Summaryception v3 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v3.3 — Layered Recursive Summarization for SillyTavern
  *
- * NON-DESTRUCTIVE: Uses SillyTavern's built-in message hiding (ghosting)
- * to exclude summarized messages from the LLM context while keeping them
+ * NON-DESTRUCTIVE: Uses message extra flags and generation interceptor
+ * to exclude summarized messages from LLM context while keeping them
  * fully visible and readable in the chat UI.
- *
- * Uses a context-aware summarizer prompt that builds incrementally:
- *   - prior_context = that layer's existing summaries
- *   - passage_in_question = the new content to summarize
- *   - player_name = active persona name
  *
  * AGPL-3.0
  */
@@ -136,145 +131,110 @@ function getPlayerName() {
 
 // ─── Message Hiding (Ghosting) ───────────────────────────────────────
 
-/**
- * Get the IGNORE symbol from SillyTavern core.
- * This is the official way to exclude messages from the LLM context
- * without removing them from the chat. Uses Symbol.for() so it won't
- * serialize to JSON (ephemeral per session).
- *
- * From PR #3763: generation interceptors set this flag on structuredClone'd
- * messages to exclude them from formatMessageHistoryItem() and
- * setOpenAIMessages().
- *
- * HOWEVER — we need persistent ghosting (survives reload), so we use a
- * two-pronged approach:
- *   1. Set a persistent flag (msg.extra.sc_ghosted = true) saved to chat
- *   2. At generation time, use a generation interceptor to apply the
- *      Symbol-based ignore flag on cloned messages
- */
-
-/**
- * Mark a message as ghosted in persistent storage.
- * The actual context exclusion happens in the generation interceptor.
- */
 function ghostMessage(messageIndex) {
     const { chat } = SillyTavern.getContext();
     const msg = chat[messageIndex];
     if (!msg) return;
-
-    // Initialize extra if needed
     if (!msg.extra) msg.extra = {};
-
-    // Already ghosted
     if (msg.extra.sc_ghosted) return;
-
-    // Set persistent flag
     msg.extra.sc_ghosted = true;
-
-    // Visual indicator in the UI
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageIndex}"]`);
     if (messageElement) {
         messageElement.classList.add('sc-ghosted');
     }
-
     log(`Ghosted message at index ${messageIndex}`);
 }
 
-/**
- * Remove ghost status from a message.
- */
 function unghostMessage(messageIndex) {
     const { chat } = SillyTavern.getContext();
     const msg = chat[messageIndex];
     if (!msg || !msg.extra) return;
-
     delete msg.extra.sc_ghosted;
-
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageIndex}"]`);
     if (messageElement) {
         messageElement.classList.remove('sc-ghosted');
     }
-
     log(`Unghosted message at index ${messageIndex}`);
 }
 
-/**
- * Ghost all messages from index 1 up to and including endIndex.
- * Skips index 0 (greeting/scenario) and already-ghosted messages.
- */
 function ghostMessagesUpTo(endIndex) {
     const { chat } = SillyTavern.getContext();
-
     for (let i = 0; i <= endIndex; i++) {
         const msg = chat[i];
         if (!msg) continue;
-
-        // Skip the first message (greeting)
         if (i === 0) continue;
-
-        // Skip real system messages that aren't ours
         if (msg.is_system && !msg.extra?.sc_ghosted) continue;
-
         ghostMessage(i);
     }
-
     log(`Ghosted messages from index 1 to ${endIndex}`);
 }
 
-/**
- * Apply ghost visual indicators to all ghosted messages in the current chat.
- * Called on chat load to restore visual state.
- */
 function applyGhostVisuals() {
-    const { chat } = SillyTavern.getContext();
-    if (!chat) return;
-
-    for (let i = 0; i < chat.length; i++) {
-        if (chat[i]?.extra?.sc_ghosted) {
+    try {
+        const { chat } = SillyTavern.getContext();
+        if (!chat) return;
+        for (let i = 0; i < chat.length; i++) {
+            const isGhosted = chat[i]?.extra?.sc_ghosted === true;
             const messageElement = document.querySelector(`#chat .mes[mesid="${i}"]`);
-            if (messageElement) {
+            if (!messageElement) continue;
+            if (isGhosted) {
                 messageElement.classList.add('sc-ghosted');
+            } else {
+                messageElement.classList.remove('sc-ghosted');
             }
         }
+    } catch (e) {
+        log('applyGhostVisuals error:', e);
     }
 }
 
-// ─── Generation Interceptor (the actual context exclusion) ───────────
+function setupGhostObserver() {
+    const chatContainer = document.querySelector('#chat');
+    if (!chatContainer) {
+        setTimeout(setupGhostObserver, 500);
+        return;
+    }
+    const observer = new MutationObserver((mutations) => {
+        let hasNewMessages = false;
+        for (const mutation of mutations) {
+            if (mutation.addedNodes.length > 0) {
+                hasNewMessages = true;
+                break;
+            }
+        }
+        if (hasNewMessages) {
+            applyGhostVisuals();
+        }
+    });
+    observer.observe(chatContainer, {
+        childList: true,
+        subtree: false,
+    });
+    log('Ghost visual observer attached to #chat');
+}
 
-/**
- * This is where ghosted messages are ACTUALLY excluded from context.
- * We hook into the generation pipeline and set the ignore flag on
- * cloned messages so they're skipped during prompt building.
- *
- * This uses the official SillyTavern mechanism from PR #3763.
- */
+// ─── Generation Interceptor ─────────────────────────────────────────
+
 function setupGenerationInterceptor() {
     const { eventSource, event_types } = SillyTavern.getContext();
 
     eventSource.on(event_types.GENERATION_STARTED, (type) => {
-        if (type === 'quiet') return; // Don't interfere with our own summarizer calls
+        if (type === 'quiet') return;
 
         const s = getSettings();
         if (!s.enabled) return;
 
         const { chat } = SillyTavern.getContext();
 
-        // Get the ignore symbol from SillyTavern core
-        const ctx = SillyTavern.getContext();
-        const IGNORE_SYMBOL = ctx.symbols?.IGNORE
-        || Symbol.for('ignore');  // Fallback
-
         for (let i = 0; i < chat.length; i++) {
             const msg = chat[i];
             if (msg?.extra?.sc_ghosted) {
-                // Clone the message to avoid persisting the symbol
-                chat[i] = structuredClone(msg);
-                if (!chat[i].extra) chat[i].extra = {};
-                chat[i].extra[IGNORE_SYMBOL] = true;
+                if (!msg.extra) msg.extra = {};
+                msg.extra.isSmallSys = true;
             }
         }
 
-        log('Generation interceptor: applied ignore flags to ghosted messages');
+        log('Generation interceptor: marked ghosted messages for exclusion');
     });
 }
 
@@ -615,7 +575,7 @@ async function summarizeOneBatch(visibleTurns) {
     }
 }
 
-// ─── Core: Inner Batch for Catchup (no isSummarizing toggle) ─────────
+// ─── Core: Inner Batch for Catchup ───────────────────────────────────
 
 async function summarizeOneBatchFromTurns(visibleTurns) {
     const s = getSettings();
@@ -694,7 +654,7 @@ async function runCatchup(visibleTurns, overflow) {
         while (!cancelled) {
             const { chat } = SillyTavern.getContext();
             const allAssistantTurns = getAssistantTurns(chat);
-            const currentVisible = allAssistantTurns.filter(t => t.index > 0 && !chat[t.index]._sc_ghosted);
+            const currentVisible = allAssistantTurns.filter(t => t.index > 0 && !chat[t.index].extra?.sc_ghosted);
 
             if (currentVisible.length <= s.verbatimTurns) break;
 
@@ -709,7 +669,7 @@ async function runCatchup(visibleTurns, overflow) {
 
                 if (consecutiveFailures >= 3) {
                     toastr.error(
-                        `3 consecutive failures — API may be down. Pausing catch-up. Progress saved; will resume on next message.`,
+                        '3 consecutive failures — API may be down. Pausing catch-up. Progress saved; will resume on next message.',
                         'Summaryception',
                         { timeOut: 8000 }
                     );
@@ -830,21 +790,14 @@ async function maybePromoteLayer(layerIndex) {
 
     log(`Layer ${layerIndex}: ${layer.length} snippets > limit ${s.snippetsPerLayer} → promoting`);
 
-    // Ensure destination layer exists
     if (!store.layers[layerIndex + 1]) store.layers[layerIndex + 1] = [];
     const destLayer = store.layers[layerIndex + 1];
 
-    // ─── Seed promotion ──────────────────────────────────────────
-    // If the destination layer is EMPTY, the oldest snippet from the
-    // source layer is promoted directly as a seed — no LLM call.
-    // This preserves maximum information as the foundational context
-    // for all future summaries in that layer.
+    // Seed promotion: if destination is empty, move oldest snippet directly
     if (destLayer.length === 0) {
         const seed = layer.shift();
-
         seed.promoted = true;
         seed.seedFromLayer = layerIndex;
-
         destLayer.push(seed);
 
         log(`Seeded Layer ${layerIndex + 1} with oldest snippet from Layer ${layerIndex} (no LLM call)`);
@@ -855,25 +808,18 @@ async function maybePromoteLayer(layerIndex) {
                     { timeOut: 2000 }
         );
 
-        // Check if source layer STILL exceeds the limit after removing the seed
-        // (e.g. if multiple messages came in at once)
         if (layer.length > s.snippetsPerLayer) {
             await maybePromoteLayer(layerIndex);
         }
-
-        // Check if destination layer now needs promotion too
         if (destLayer.length > s.snippetsPerLayer) {
             await maybePromoteLayer(layerIndex + 1);
         }
-
         return;
     }
 
-    // ─── Normal promotion: summarize oldest N snippets ───────────
+    // Normal promotion: summarize oldest N snippets
     const toMerge = layer.splice(0, s.snippetsPerPromotion);
     const storyTxt = toMerge.map(sn => sn.text).join(' | ');
-
-    // Prior context = destination layer's existing snippets (includes the seed)
     const contextStr = destLayer.map(sn => sn.text).join(' | ');
 
     toastr.info(
@@ -884,7 +830,6 @@ async function maybePromoteLayer(layerIndex) {
 
     const metaSummary = await callSummarizer(storyTxt, contextStr);
     if (!metaSummary) {
-        // Restore on failure
         layer.unshift(...toMerge);
         return;
     }
@@ -898,7 +843,6 @@ async function maybePromoteLayer(layerIndex) {
 
     log(`Layer ${layerIndex + 1} now has ${destLayer.length} snippets`);
 
-    // Cascade: check both layers
     if (layer.length > s.snippetsPerLayer) {
         await maybePromoteLayer(layerIndex);
     }
@@ -937,38 +881,46 @@ function assembleSummaryBlock() {
 // ─── Injection via setExtensionPrompt ────────────────────────────────
 
 function updateInjection() {
-    const { setExtensionPrompt } = SillyTavern.getContext();
-    const s = getSettings();
+    try {
+        const { setExtensionPrompt } = SillyTavern.getContext();
+        const s = getSettings();
 
-    if (!s.enabled) {
-        setExtensionPrompt(MODULE_NAME, '', 1, 0, false, 0);
-        return;
+        if (!s.enabled) {
+            setExtensionPrompt(MODULE_NAME, '', 1, 0, false, 0);
+            return;
+        }
+
+        const summaryBlock = assembleSummaryBlock();
+        if (!summaryBlock) {
+            setExtensionPrompt(MODULE_NAME, '', 1, 0, false, 0);
+            return;
+        }
+
+        const depth = s.verbatimTurns;
+        setExtensionPrompt(MODULE_NAME, summaryBlock, 1, depth, false, 0);
+
+        log(`Injection updated: ${summaryBlock.length} chars at depth ${depth}`);
+    } catch (e) {
+        log('updateInjection error:', e);
     }
-
-    const summaryBlock = assembleSummaryBlock();
-    if (!summaryBlock) {
-        setExtensionPrompt(MODULE_NAME, '', 1, 0, false, 0);
-        return;
-    }
-
-    const depth = s.verbatimTurns;
-    setExtensionPrompt(MODULE_NAME, summaryBlock, 1, depth, false, 0);
-
-    log(`Injection updated: ${summaryBlock.length} chars at depth ${depth}`);
 }
 
 // ─── Event Handlers ──────────────────────────────────────────────────
 
 function onMessageReceived(messageIndex) {
-    const { chat } = SillyTavern.getContext();
-    const msg = chat[messageIndex];
-    if (msg && !msg.is_user && !msg.is_system) {
-        log('New assistant message at index', messageIndex);
-        setTimeout(async () => {
-            await maybeSummarizeTurns();
-            updateInjection();
-            updateUI();
-        }, 500);
+    try {
+        const { chat } = SillyTavern.getContext();
+        const msg = chat[messageIndex];
+        if (msg && !msg.is_user && !msg.is_system) {
+            log('New assistant message at index', messageIndex);
+            setTimeout(async () => {
+                await maybeSummarizeTurns();
+                updateInjection();
+                updateUI();
+            }, 500);
+        }
+    } catch (e) {
+        log('onMessageReceived error:', e);
     }
 }
 
@@ -990,12 +942,14 @@ function onGenerationStarted() {
 
 function registerSlashCommands() {
     try {
-        const { SlashCommandParser, SlashCommand } = SillyTavern.getContext();
+        const ctx = SillyTavern.getContext();
 
-        if (!SlashCommandParser?.addCommandObject) {
+        if (!ctx.SlashCommandParser?.addCommandObject || !ctx.SlashCommand) {
             log('SlashCommandParser not available, skipping command registration.');
             return;
         }
+
+        const { SlashCommandParser, SlashCommand } = ctx;
 
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'sc-status',
@@ -1030,8 +984,8 @@ function registerSlashCommands() {
                 store.summarizedUpTo = -1;
                 await saveChatStore();
                 try {
-                    const ctx = SillyTavern.getContext();
-                    if (ctx.saveChat) await ctx.saveChat();
+                    const ctx2 = SillyTavern.getContext();
+                    if (ctx2.saveChat) await ctx2.saveChat();
                 } catch (e) {
                     log('Could not save chat:', e);
                 }
@@ -1057,55 +1011,59 @@ function registerSlashCommands() {
 // ─── Settings UI ─────────────────────────────────────────────────────
 
 function updateUI() {
-    const s = getSettings();
-    const store = getChatStore();
-
-    $('#sc_enabled').prop('checked', s.enabled);
-    $('#sc_verbatim_turns').val(s.verbatimTurns);
-    $('#sc_verbatim_turns_val').text(s.verbatimTurns);
-    $('#sc_turns_per_summary').val(s.turnsPerSummary);
-    $('#sc_turns_per_summary_val').text(s.turnsPerSummary);
-    $('#sc_snippets_per_layer').val(s.snippetsPerLayer);
-    $('#sc_snippets_per_layer_val').text(s.snippetsPerLayer);
-    $('#sc_snippets_per_promotion').val(s.snippetsPerPromotion);
-    $('#sc_snippets_per_promotion_val').text(s.snippetsPerPromotion);
-    $('#sc_max_layers').val(s.maxLayers);
-    $('#sc_max_layers_val').text(s.maxLayers);
-    $('#sc_injection_template').val(s.injectionTemplate);
-    $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
-    $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
-    $('#sc_debug_mode').prop('checked', s.debugMode);
-
-    let ghostedCount = 0;
     try {
-        const { chat } = SillyTavern.getContext();
-        ghostedCount = chat.filter(m => m.extra?.sc_ghosted).length;
-    } catch (e) { /* no chat loaded */ }
+        const s = getSettings();
+        const store = getChatStore();
 
-    let statsHtml = '';
-    statsHtml += `<div class="sc-layer-stat">👻 <strong>${ghostedCount}</strong> messages ghosted (hidden from LLM, visible to you)</div>`;
-    if (store.layers) {
-        for (let i = store.layers.length - 1; i >= 0; i--) {
-            const layer = store.layers[i];
-            if (layer && layer.length > 0) {
-                const label = i === 0 ? 'Layer 0 (turn summaries)' : `Layer ${i} (depth ${i} meta)`;
-                statsHtml += `<div class="sc-layer-stat">
-                <span class="sc-layer-label">${label}:</span>
-                <strong>${layer.length}</strong> / ${s.snippetsPerLayer} snippets
-                </div>`;
+        $('#sc_enabled').prop('checked', s.enabled);
+        $('#sc_verbatim_turns').val(s.verbatimTurns);
+        $('#sc_verbatim_turns_val').text(s.verbatimTurns);
+        $('#sc_turns_per_summary').val(s.turnsPerSummary);
+        $('#sc_turns_per_summary_val').text(s.turnsPerSummary);
+        $('#sc_snippets_per_layer').val(s.snippetsPerLayer);
+        $('#sc_snippets_per_layer_val').text(s.snippetsPerLayer);
+        $('#sc_snippets_per_promotion').val(s.snippetsPerPromotion);
+        $('#sc_snippets_per_promotion_val').text(s.snippetsPerPromotion);
+        $('#sc_max_layers').val(s.maxLayers);
+        $('#sc_max_layers_val').text(s.maxLayers);
+        $('#sc_injection_template').val(s.injectionTemplate);
+        $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
+        $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
+        $('#sc_debug_mode').prop('checked', s.debugMode);
+
+        let ghostedCount = 0;
+        try {
+            const { chat } = SillyTavern.getContext();
+            ghostedCount = chat.filter(m => m.extra?.sc_ghosted).length;
+        } catch (e) { /* no chat loaded */ }
+
+        let statsHtml = '';
+        statsHtml += `<div class="sc-layer-stat">👻 <strong>${ghostedCount}</strong> messages ghosted (hidden from LLM, visible to you)</div>`;
+        if (store.layers) {
+            for (let i = store.layers.length - 1; i >= 0; i--) {
+                const layer = store.layers[i];
+                if (layer && layer.length > 0) {
+                    const label = i === 0 ? 'Layer 0 (turn summaries)' : `Layer ${i} (depth ${i} meta)`;
+                    statsHtml += `<div class="sc-layer-stat">
+                    <span class="sc-layer-label">${label}:</span>
+                    <strong>${layer.length}</strong> / ${s.snippetsPerLayer} snippets
+                    </div>`;
+                }
             }
         }
-    }
-    statsHtml += `<div class="sc-layer-stat sc-muted">Summarized up to chat index: ${store.summarizedUpTo ?? -1}</div>`;
-    if (!store.layers?.length || store.layers.every(l => !l || l.length === 0)) {
-        statsHtml = '<div class="sc-layer-stat sc-muted">No summaries yet for this chat.</div>';
-    }
-    $('#sc_layer_stats').html(statsHtml);
+        statsHtml += `<div class="sc-layer-stat sc-muted">Summarized up to chat index: ${store.summarizedUpTo ?? -1}</div>`;
+        if (!store.layers?.length || store.layers.every(l => !l || l.length === 0)) {
+            statsHtml = '<div class="sc-layer-stat sc-muted">No summaries yet for this chat.</div>';
+        }
+        $('#sc_layer_stats').html(statsHtml);
 
-    const preview = assembleSummaryBlock();
-    $('#sc_preview').val(preview || '(empty — no summaries yet)');
+        const preview = assembleSummaryBlock();
+        $('#sc_preview').val(preview || '(empty — no summaries yet)');
 
-    updateSnippetBrowser();
+        updateSnippetBrowser();
+    } catch (e) {
+        log('updateUI error:', e);
+    }
 }
 
 function updateSnippetBrowser() {
@@ -1127,9 +1085,10 @@ function updateSnippetBrowser() {
                 : sn.mergedCount
                 ? `merged ${sn.mergedCount} from L${sn.fromLayer}`
                 : '';
+                const seedStr = sn.promoted ? ' 🌱' : '';
                 html += `<div class="sc-snippet" data-layer="${i}" data-idx="${j}">
                 <span class="sc-snippet-text">${escapeHtml(sn.text)}</span>
-                <span class="sc-snippet-meta">${rangeStr}</span>
+                <span class="sc-snippet-meta">${rangeStr}${seedStr}</span>
                 <button class="sc-snippet-delete menu_button fa-solid fa-xmark" title="Delete this snippet"></button>
                 </div>`;
             }
@@ -1157,61 +1116,6 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
-}
-
-/**
- * Apply ghost visual indicators to all ghosted messages.
- * Uses a short delay loop to catch dynamically rendered messages.
- */
-function applyGhostVisuals() {
-    const { chat } = SillyTavern.getContext();
-    if (!chat) return;
-
-    for (let i = 0; i < chat.length; i++) {
-        const isGhosted = chat[i]?.extra?.sc_ghosted === true;
-        const messageElement = document.querySelector(`#chat .mes[mesid="${i}"]`);
-        if (!messageElement) continue;
-
-        if (isGhosted) {
-            messageElement.classList.add('sc-ghosted');
-        } else {
-            messageElement.classList.remove('sc-ghosted');
-        }
-    }
-}
-
-/**
- * Set up a MutationObserver on the chat container to catch
- * newly rendered messages and apply ghost visuals.
- */
-function setupGhostObserver() {
-    const chatContainer = document.querySelector('#chat');
-    if (!chatContainer) {
-        // Chat container not ready yet, retry
-        setTimeout(setupGhostObserver, 500);
-        return;
-    }
-
-    const observer = new MutationObserver((mutations) => {
-        // Only react to added nodes (new messages rendered)
-        let hasNewMessages = false;
-        for (const mutation of mutations) {
-            if (mutation.addedNodes.length > 0) {
-                hasNewMessages = true;
-                break;
-            }
-        }
-        if (hasNewMessages) {
-            applyGhostVisuals();
-        }
-    });
-
-    observer.observe(chatContainer, {
-        childList: true,
-        subtree: false,
-    });
-
-    log('Ghost visual observer attached to #chat');
 }
 
 function bindUIEvents() {
@@ -1269,7 +1173,6 @@ function bindUIEvents() {
         store.layers = [];
         store.summarizedUpTo = -1;
         await saveChatStore();
-        // Save the chat to persist the unghosted state
         try {
             const ctx = SillyTavern.getContext();
             if (ctx.saveChat) await ctx.saveChat();
@@ -1329,31 +1232,29 @@ function bindUIEvents() {
                 const { chat } = SillyTavern.getContext();
                 const store = getChatStore();
 
-                // First, unghost everything from the current state
+                // Unghost everything first
                 for (let i = 0; i < chat.length; i++) {
                     if (chat[i]?.extra?.sc_ghosted) {
                         unghostMessage(i);
                     }
                 }
 
-                // Load the imported data
+                // Load imported data
                 store.layers = data.layers;
                 store.summarizedUpTo = data.summarizedUpTo ?? -1;
 
-                // Now ghost messages up to the imported summarizedUpTo
+                // Re-ghost up to imported pointer
                 if (store.summarizedUpTo >= 0) {
                     ghostMessagesUpTo(store.summarizedUpTo);
                 }
 
                 await saveChatStore();
-
                 try {
                     const ctx = SillyTavern.getContext();
                     if (ctx.saveChat) await ctx.saveChat();
                 } catch (e) {
                     log('Could not save chat:', e);
                 }
-
                 updateInjection();
                 updateUI();
                 toastr.success(
@@ -1402,6 +1303,6 @@ function bindUIEvents() {
         applyGhostVisuals();
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v3 loaded. Ghost mode — non-destructive layered summarization.');
+        console.log(LOG_PREFIX, 'v3.3 loaded. Ghost mode — non-destructive layered summarization.');
     });
 })();
