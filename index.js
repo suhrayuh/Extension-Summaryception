@@ -1283,6 +1283,69 @@ function bindUIEvents() {
         saveSettings();
     });
 
+    $('#sc_repair').on('click', async function () {
+        const { chat } = SillyTavern.getContext();
+        let repaired = 0;
+
+        const progressToast = toastr.info(
+            'Scanning for orphaned messages...',
+            'Summaryception — Repair',
+            { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false }
+        );
+
+        for (let i = 0; i < chat.length; i++) {
+            const m = chat[i];
+
+            // Find messages that are is_system or is_hidden but shouldn't be
+            // They have real content, aren't user messages, and don't have our ghost flag
+            const isStuckHidden = (m.is_system || m.is_hidden)
+            && !m.is_user
+            && !m.extra?.sc_ghosted
+            && m.mes
+            && m.mes.trim().length > 0;
+
+            if (isStuckHidden) {
+                // Try to unhide via slash command
+                try {
+                    await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
+                } catch (e) {
+                    log(`Repair: failed to unhide ${i}:`, e);
+                }
+
+                // Also clear the flags directly
+                m.is_system = false;
+                delete m.is_hidden;
+
+                repaired++;
+
+                if (repaired % 5 === 0) {
+                    $(progressToast).find('.toast-message').text(
+                        `Repairing: found ${repaired} orphaned messages...`
+                    );
+                }
+            }
+        }
+
+        toastr.clear(progressToast);
+
+        if (repaired > 0) {
+            try {
+                const ctx = SillyTavern.getContext();
+                if (ctx.saveChat) await ctx.saveChat();
+            } catch (e) {
+                log('Could not save chat:', e);
+            }
+            updateUI();
+            toastr.success(
+                `Repaired ${repaired} orphaned messages. They are now visible to the summarizer again.`,
+                'Summaryception',
+                { timeOut: 5000 }
+            );
+        } else {
+            toastr.info('No orphaned messages found.', 'Summaryception', { timeOut: 3000 });
+        }
+    });
+
     $('#sc_clear_memory').on('click', async function () {
         if (!confirm('Clear ALL Summaryception memory for this chat and unghost all messages?')) return;
 
