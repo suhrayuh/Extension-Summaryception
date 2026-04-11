@@ -1,5 +1,5 @@
 /**
- * Summaryception v5.1.6 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v5.1.7 — Layered Recursive Summarization for SillyTavern
  *
  * NON-DESTRUCTIVE: Uses SillyTavern's native /hide and /unhide commands
  * to exclude summarized messages from LLM context while keeping them
@@ -611,7 +611,7 @@ async function maybeSummarizeTurns() {
     const allAssistantTurns = getAssistantTurns(chat);
     const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
 
-    log(`Visible assistant turns (excluding turn 0): ${visibleTurns.length}, limit: ${s.verbatimTurns}`);
+    log(`Visible assistant turns: ${visibleTurns.length}, limit: ${s.verbatimTurns}`);
 
     if (visibleTurns.length <= s.verbatimTurns) return;
 
@@ -648,17 +648,17 @@ async function maybeSummarizeTurns() {
     // ─── Normal operation: single batch ──────────────────────────
     const success = await summarizeOneBatch(visibleTurns);
 
-    // If the batch failed, stop here. Don't recursively retry — the next
-    // incoming message will trigger another attempt. This prevents the
-    // infinite loop where a persistently failing connection causes
-    // maybeSummarizeTurns → summarizeOneBatch(fail) → maybeSummarizeTurns → ...
+    // If the batch failed, STOP. Don't recursively retry the same failing batch.
+    // The next incoming message will trigger a fresh attempt. This prevents the
+    // infinite loop: maybeSummarizeTurns → summarizeOneBatch(fail) → overflow
+    // still true → maybeSummarizeTurns → summarizeOneBatch(fail) → ...
     if (!success) {
         log('Batch failed, stopping summarization cycle to avoid retry loop.');
         return;
     }
 
     // Check if there's still a small overflow (not a backlog)
-    const remaining = getAssistantTurns(chat).filter(t => t.index > 0 && !chat[t.index].extra?.sc_ghosted);
+    const remaining = getAssistantTurns(chat).filter(t => !chat[t.index].extra?.sc_ghosted);
     if (remaining.length > s.verbatimTurns && remaining.length - s.verbatimTurns <= backlogThreshold) {
         await maybeSummarizeTurns();
     }
@@ -686,7 +686,6 @@ async function summarizeOneBatch(visibleTurns) {
 
         if (!store.layers[0]) store.layers[0] = [];
         const passageStart = store.summarizedUpTo < 0 ? 0 : store.summarizedUpTo + 1;
-        }
 
         const storyTxt = buildPassageFromRange(chat, passageStart, endIdx);
         if (!storyTxt.trim()) return false;
@@ -751,7 +750,6 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
 
     if (!store.layers[0]) store.layers[0] = [];
     const passageStart = store.summarizedUpTo < 0 ? 0 : store.summarizedUpTo + 1;
-    }
 
     const storyTxt = buildPassageFromRange(chat, passageStart, endIdx);
     if (!storyTxt.trim()) return false;
@@ -1959,7 +1957,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     $('#extensions_settings2').append(html);
 
     bindUIEvents();
-    initConnectionUI();    // ← ADD THIS LINE
+    initConnectionUI();
 
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
@@ -1970,6 +1968,6 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     eventSource.on(event_types.APP_READY, () => {
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v5.1.6 loaded. Connection Settings available');
+        console.log(LOG_PREFIX, 'v5.1.7 loaded. Connection Settings available');
     });
 })();
