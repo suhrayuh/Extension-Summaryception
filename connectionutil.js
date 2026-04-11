@@ -16,6 +16,25 @@
 
 const MODULE_NAME = '[Summaryception][Connection]';
 
+// ─── Custom Error Class ──────────────────────────────────────────────
+
+/**
+ * Error class for connection errors with explicit retryable flag.
+ * The retry logic in callSummarizer checks for this to avoid
+ * burning through retries on errors that will never succeed
+ * (e.g. missing config, auth failures, deleted profiles).
+ */
+class ConnectionError extends Error {
+    constructor(message, { retryable = false, status = null } = {}) {
+        super(message);
+        this.name = 'ConnectionError';
+        this.retryable = retryable;
+        this.status = status;
+    }
+}
+
+export { ConnectionError };
+
 // ─── CORS Proxy Helper ───────────────────────────────────────────────
 
 /**
@@ -55,7 +74,7 @@ function getProxyHeaders() {
  * @param {string} systemPrompt - The system prompt
  * @param {string} userPrompt - The user prompt
  * @returns {Promise<string>} - The generated response text
- * @throws {Error} - If the request fails
+ * @throws {ConnectionError|Error} - If the request fails
  */
 export async function sendSummarizerRequest(settings, systemPrompt, userPrompt) {
     const source = settings.connectionSource || 'default';
@@ -82,7 +101,10 @@ async function sendViaDefault(systemPrompt, userPrompt) {
     const { generateRaw } = SillyTavern.getContext();
 
     if (!generateRaw) {
-        throw new Error('generateRaw is not available in the current SillyTavern context.');
+        throw new ConnectionError(
+            'generateRaw is not available in the current SillyTavern context.',
+            { retryable: false }
+        );
     }
 
     const result = await generateRaw({
@@ -91,7 +113,10 @@ async function sendViaDefault(systemPrompt, userPrompt) {
     });
 
     if (!result || typeof result !== 'string') {
-        throw new Error('generateRaw returned an empty or invalid response.');
+        throw new ConnectionError(
+            'generateRaw returned an empty or invalid response.',
+            { retryable: true }
+        );
     }
 
     return result;
@@ -106,23 +131,28 @@ async function sendViaDefault(systemPrompt, userPrompt) {
  */
 async function sendViaProfile(profileId, systemPrompt, userPrompt) {
     if (!profileId) {
-        throw new Error('No Connection Profile selected. Please select one in Summaryception settings.');
+        throw new ConnectionError(
+            'No Connection Profile selected. Please select one in Summaryception settings.',
+            { retryable: false }
+        );
     }
 
     const context = SillyTavern.getContext();
     const service = context.ConnectionManagerRequestService;
 
     if (!service) {
-        throw new Error(
+        throw new ConnectionError(
             'ConnectionManagerRequestService is not available. ' +
-            'Your SillyTavern version may be too old. Requires ST with PR #3603 (March 2025+).'
+            'Your SillyTavern version may be too old. Requires ST with PR #3603 (March 2025+).',
+                                  { retryable: false }
         );
     }
 
     if (typeof service.sendRequest !== 'function') {
-        throw new Error(
+        throw new ConnectionError(
             'ConnectionManagerRequestService.sendRequest() is not available. ' +
-            'Please update SillyTavern to the latest staging version.'
+            'Please update SillyTavern to the latest staging version.',
+            { retryable: false }
         );
     }
 
@@ -152,39 +182,57 @@ async function sendViaProfile(profileId, systemPrompt, userPrompt) {
             // Last resort: try to find any string value
             const str = JSON.stringify(raw);
             console.warn('[Summaryception][Connection] Unexpected return type from sendRequest:', str.substring(0, 500));
-            throw new Error(
+            throw new ConnectionError(
                 `Connection Profile returned unexpected type: ${typeof raw}. ` +
                 `Preview: ${str.substring(0, 200)}. ` +
-                `Please report this on the Summaryception GitHub.`
+                `Please report this on the Summaryception GitHub.`,
+                { retryable: false }
             );
         } else {
-            throw new Error('Connection Profile returned an empty or invalid response.');
+            throw new ConnectionError(
+                'Connection Profile returned an empty or invalid response.',
+                { retryable: true }
+            );
         }
 
         if (!result || !result.trim()) {
-            throw new Error('Connection Profile returned an empty response.');
+            throw new ConnectionError(
+                'Connection Profile returned an empty response.',
+                { retryable: true }
+            );
         }
 
         return result;
 
     } catch (error) {
-        const msg = error?.message || String(error);
+        // If it's already a ConnectionError we threw above, re-throw as-is
+        if (error instanceof ConnectionError) throw error;
 
-        if (msg.includes('401') || msg.toLowerCase().includes('unauthorized')) {
-            throw new Error(
-                `Connection Profile auth failed (401). This may be the API key switching bug (ST Issue #5348). ` +
-                `Update SillyTavern to staging (March 30, 2026+). Original: ${msg}`
+        const msg = error?.message || String(error);
+        const status = error?.status || error?.response?.status;
+
+        if (status === 401 || msg.includes('401') || msg.toLowerCase().includes('unauthorized')) {
+            throw new ConnectionError(
+                `Connection Profile auth failed (401). This is likely the API key switching bug ` +
+                `(ST Issue #5348). Update SillyTavern to staging (March 30, 2026+) to fix this. ` +
+                `Original error: ${msg}`,
+                { retryable: false, status: 401 }
             );
         }
 
         if (msg.includes('not found') || msg.includes('profile')) {
-            throw new Error(
+            throw new ConnectionError(
                 `Connection Profile "${profileId}" not found. It may have been deleted. ` +
-                `Please re-select a profile in Summaryception settings.`
+                `Please re-select a profile in Summaryception settings.`,
+                { retryable: false, status: 404 }
             );
         }
 
-        throw new Error(`Connection Profile request failed: ${msg}`);
+        // Unknown errors from the ST service — could be transient, allow retry
+        throw new ConnectionError(
+            `Connection Profile request failed: ${msg}`,
+            { retryable: true, status: status }
+        );
     }
 }
 
@@ -196,10 +244,16 @@ async function sendViaProfile(profileId, systemPrompt, userPrompt) {
  */
 async function sendViaOllama(url, model, systemPrompt, userPrompt) {
     if (!url) {
-        throw new Error('Ollama URL is not configured. Please set it in Summaryception settings.');
+        throw new ConnectionError(
+            'Ollama URL is not configured. Please set it in Summaryception settings.',
+            { retryable: false }
+        );
     }
     if (!model) {
-        throw new Error('Ollama model is not selected. Please select one in Summaryception settings.');
+        throw new ConnectionError(
+            'Ollama model is not selected. Please select one in Summaryception settings.',
+            { retryable: false }
+        );
     }
 
     const baseUrl = url.replace(/\/+$/, '');
@@ -244,23 +298,30 @@ async function sendViaOllama(url, model, systemPrompt, userPrompt) {
                 }),
             });
         } catch (directError) {
-            throw new Error(
+            throw new ConnectionError(
                 `Failed to connect to Ollama at ${baseUrl}. ` +
                 `CORS proxy error: ${proxyError.message}. Direct error: ${directError.message}. ` +
-                `Make sure enableCorsProxy is set to true in config.yaml, or set OLLAMA_ORIGINS=* on your Ollama instance.`
+                `Make sure enableCorsProxy is set to true in config.yaml, or set OLLAMA_ORIGINS=* on your Ollama instance.`,
+                { retryable: true }
             );
         }
     }
 
     if (!response.ok) {
         const errorText = await response.text().catch(() => 'Unknown error');
-        throw new Error(`Ollama request failed (${response.status}): ${errorText}`);
+        throw new ConnectionError(
+            `Ollama request failed (${response.status}): ${errorText}`,
+                                  { retryable: response.status >= 500, status: response.status }
+        );
     }
 
     const data = await response.json();
 
     if (!data?.message?.content) {
-        throw new Error('Ollama returned an empty or invalid response.');
+        throw new ConnectionError(
+            'Ollama returned an empty or invalid response.',
+            { retryable: true }
+        );
     }
 
     return data.message.content;
@@ -324,10 +385,16 @@ export async function fetchOllamaModels(url) {
  */
 async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt) {
     if (!url) {
-        throw new Error('OpenAI Compatible URL is not configured. Please set it in Summaryception settings.');
+        throw new ConnectionError(
+            'OpenAI Compatible URL is not configured. Please set it in Summaryception settings.',
+            { retryable: false }
+        );
     }
     if (!model) {
-        throw new Error('OpenAI Compatible model name is not set. Please enter one in Summaryception settings.');
+        throw new ConnectionError(
+            'OpenAI Compatible model name is not set. Please enter one in Summaryception settings.',
+            { retryable: false }
+        );
     }
 
     const baseUrl = url.replace(/\/+$/, '');
@@ -382,34 +449,57 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt) {
                     body: body,
                 });
             } catch (directError) {
-                throw new Error(
+                throw new ConnectionError(
                     `Failed to connect to ${baseUrl}. ` +
                     `Enable the CORS proxy in config.yaml (enableCorsProxy: true). ` +
-                    `Proxy error: ${proxyError.message}. Direct error: ${directError.message}`
+                    `Proxy error: ${proxyError.message}. Direct error: ${directError.message}`,
+                    { retryable: true }
                 );
             }
         }
     } else {
         // Cloud endpoint: direct fetch (should have CORS headers)
-        response = await fetch(endpoint, {
-            method: 'POST',
-            headers: headers,
-            body: body,
-        });
+        try {
+            response = await fetch(endpoint, {
+                method: 'POST',
+                headers: headers,
+                body: body,
+            });
+        } catch (fetchError) {
+            throw new ConnectionError(
+                `Failed to connect to ${baseUrl}: ${fetchError.message}`,
+                { retryable: true }
+            );
+        }
     }
 
     if (!response.ok) {
         const errorText = await response.text().catch(() => 'Unknown error');
         if (response.status === 401) {
-            throw new Error('OpenAI Compatible endpoint returned 401 Unauthorized. Check your API key.');
+            throw new ConnectionError(
+                'OpenAI Compatible endpoint returned 401 Unauthorized. Check your API key.',
+                { retryable: false, status: 401 }
+            );
         }
-        throw new Error(`OpenAI Compatible request failed (${response.status}): ${errorText}`);
+        if (response.status === 403) {
+            throw new ConnectionError(
+                `OpenAI Compatible endpoint returned 403 Forbidden: ${errorText}`,
+                { retryable: false, status: 403 }
+            );
+        }
+        throw new ConnectionError(
+            `OpenAI Compatible request failed (${response.status}): ${errorText}`,
+                                  { retryable: response.status >= 500 || response.status === 429, status: response.status }
+        );
     }
 
     const data = await response.json();
 
     if (!data?.choices?.[0]?.message?.content) {
-        throw new Error('OpenAI Compatible endpoint returned an empty or invalid response.');
+        throw new ConnectionError(
+            'OpenAI Compatible endpoint returned an empty or invalid response.',
+            { retryable: true }
+        );
     }
 
     return data.choices[0].message.content;

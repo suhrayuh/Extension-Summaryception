@@ -101,6 +101,15 @@ function parseRetryAfter(error) {
 
 function isRetryableError(error) {
     if (error?.name === 'AbortError') return false;
+
+    // ConnectionError from connectionutil.js carries an explicit retryable flag.
+    // This prevents burning retries on config/auth errors (missing model, bad API key,
+    // deleted profile, missing URL) that will never succeed no matter how many times
+    // we retry. Uses duck-typing on .name to avoid needing to import the class.
+    if (error?.name === 'ConnectionError' && typeof error.retryable === 'boolean') {
+        return error.retryable;
+    }
+
     if (error?.name === 'TypeError' && error?.message?.includes('fetch')) return true;
     const status = error?.status || error?.response?.status || error?.statusCode;
     if (status && RETRY_CONFIG.retryableStatuses.includes(status)) return true;
@@ -600,7 +609,16 @@ async function maybeSummarizeTurns() {
     }
 
     // ─── Normal operation: single batch ──────────────────────────
-    await summarizeOneBatch(visibleTurns);
+    const success = await summarizeOneBatch(visibleTurns);
+
+    // If the batch failed, stop here. Don't recursively retry — the next
+    // incoming message will trigger another attempt. This prevents the
+    // infinite loop where a persistently failing connection causes
+    // maybeSummarizeTurns → summarizeOneBatch(fail) → maybeSummarizeTurns → ...
+    if (!success) {
+        log('Batch failed, stopping summarization cycle to avoid retry loop.');
+        return;
+    }
 
     // Check if there's still a small overflow (not a backlog)
     const remaining = getAssistantTurns(chat).filter(t => t.index > 0 && !chat[t.index].extra?.sc_ghosted);
@@ -1812,6 +1830,6 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     eventSource.on(event_types.APP_READY, () => {
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v5.1.2 loaded. Connection Settings available');
+        console.log(LOG_PREFIX, 'v5.1.3 loaded. Connection Settings available');
     });
 })();
