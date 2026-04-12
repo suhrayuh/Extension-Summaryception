@@ -87,6 +87,14 @@
                             to save costs while keeping your main API for RP.
                         </small>
 
+                        <div class="summaryception-setting-row">
+                            <label for="sc_summarizer_response_length">
+                                <span>Summarizer Response Length</span>
+                                <small>Override max response tokens for summarizer calls (Default/Profile modes). 0 = use your preset's value. If you get "max_tokens > 4096 must have stream=true" errors, set to 4096. For reasoning models, ensure this is high enough for thinking + output.</small>
+                            </label>
+                            <input id="sc_summarizer_response_length" type="number" class="text_pole" min="0" step="100" value="0" placeholder="0 = use preset default" />
+                        </div>
+
                         <!-- Connection Source Selector -->
                         <div class="summaryception-setting-row">
                             <label for="summaryception_connection_source">

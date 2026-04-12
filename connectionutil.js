@@ -85,7 +85,7 @@ export async function sendSummarizerRequest(settings, systemPrompt, userPrompt) 
             return await sendViaOpenAI(settings.openaiUrl, settings.openaiKey, settings.openaiModel, systemPrompt, userPrompt, settings.openaiMaxTokens);
         case 'default':
         default:
-            return await sendViaDefault(systemPrompt, userPrompt);
+            return await sendViaDefault(systemPrompt, userPrompt, settings.summarizerResponseLength);
     }
 }
 
@@ -94,7 +94,7 @@ export async function sendSummarizerRequest(settings, systemPrompt, userPrompt) 
 /**
  * Uses ST's built-in generateRaw(), which routes through the active connection.
  */
-async function sendViaDefault(systemPrompt, userPrompt) {
+async function sendViaDefault(systemPrompt, userPrompt, responseLength) {
     const { generateRaw } = SillyTavern.getContext();
 
     if (!generateRaw) {
@@ -104,10 +104,21 @@ async function sendViaDefault(systemPrompt, userPrompt) {
         );
     }
 
-    const result = await generateRaw({
+    const options = {
         systemPrompt: systemPrompt,
         prompt: userPrompt,
-    });
+    };
+
+    // Only override response length if explicitly set.
+    // 0 = use whatever the user's preset has.
+    // Users hitting "max_tokens > 4096 must have stream=true" should either:
+    //   - Set this to 4096 or lower
+    //   - Switch to OpenAI Compatible mode (which uses streaming)
+    if (responseLength && responseLength > 0) {
+        options.responseLength = responseLength;
+    }
+
+    const result = await generateRaw(options);
 
     if (!result || typeof result !== 'string') {
         throw new ConnectionError(

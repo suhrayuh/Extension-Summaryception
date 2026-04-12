@@ -1,5 +1,5 @@
 /**
- * Summaryception v5.2.0 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v5.2.1 — Layered Recursive Summarization for SillyTavern
  *
  * NON-DESTRUCTIVE: Uses SillyTavern's native /hide and /unhide commands
  * to exclude summarized messages from LLM context while keeping them
@@ -60,6 +60,7 @@ const defaultSettings = Object.freeze({
 
     // ─── Connection Settings ─────────────────────────────────────
     connectionSource: 'default',          // 'default' | 'profile' | 'ollama' | 'openai'
+    summarizerResponseLength: 0,          // 0 = use preset default; set lower if you get "max_tokens > 4096 must have stream=true" errors
     connectionProfileId: '',              // ID of selected ST Connection Profile
     ollamaUrl: 'http://localhost:11434',
     ollamaModel: '',
@@ -1236,6 +1237,7 @@ function updateUI() {
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
         $('#sc_debug_mode').prop('checked', s.debugMode);
         $('#sc_strip_patterns').val((s.stripPatterns || []).join('\n'));
+        $('#sc_summarizer_response_length').val(s.summarizerResponseLength || 0);
 
         let ghostedCount = 0;
         try {
@@ -1468,6 +1470,11 @@ function bindUIEvents() {
         getSettings().enabled = $(this).prop('checked');
         saveSettings();
         updateInjection();
+    });
+
+    $('#sc_summarizer_response_length').on('input', function () {
+        getSettings().summarizerResponseLength = parseInt($(this).val(), 10) || 0;
+        saveSettings();
     });
 
     $('#sc_strip_patterns').on('change', function () {
@@ -1998,6 +2005,6 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     eventSource.on(event_types.APP_READY, () => {
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v5.2.0 loaded. Connection Settings available');
+        console.log(LOG_PREFIX, 'v5.2.1 loaded. Connection Settings available');
     });
 })();
