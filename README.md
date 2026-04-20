@@ -278,6 +278,27 @@ Restart SillyTavern and enable the extension.
 
 ---
 
+## 🔀 Fork Changes
+
+This fork adds a small set of practical changes aimed at long-form SillyTavern roleplay workflows:
+
+- **Native SillyTavern macro resolution in summarizer prompts**
+  - Custom prompts can now resolve native ST macros such as `{{outlet::calendar}}` before the summary request is sent.
+- **Bounded deepest-layer retention mode**
+  - Adds a `drop_oldest` mode so the deepest layer can stay within its configured capacity instead of preserving overflow forever.
+- **Token-budgeted recency injection**
+  - Adds `maxInjectionTokens` so only the newest complete summary snippets that fit within a token budget are injected.
+- **Safer internal injection placeholder**
+  - Renames Summaryception's internal wrapper placeholder from `{{summary}}` to `{{sc_snippets}}` to avoid collisions with SillyTavern's built-in summary macro.
+
+### Testing / provenance note
+
+- These fork changes were vibecoded with GPT-5.4 and Claude Opus 4.7 assistance.
+- They were also manually tested by the fork maintainer and are currently working in actual use.
+- The new retention mode has been implemented, but it has **not** been fully validated in a long enough live chat yet.
+
+---
+
 ## 🤝 Credits
 
 Built with frustration at context limits and love for long-form roleplay.
