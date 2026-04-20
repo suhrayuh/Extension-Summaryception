@@ -29,7 +29,10 @@ const defaultSettings = Object.freeze({
     snippetsPerLayer: 30,
     snippetsPerPromotion: 3,
     maxLayers: 5,
-    injectionTemplate: '[Summary of past events: {{summary}}]',
+    resolveNativeMacros: true,
+    retentionMode: 'preserve',      // 'preserve' | 'drop_oldest'
+    maxInjectionTokens: 0,          // 0 = unlimited, inject all snippets
+    injectionTemplate: '[Summary of past events: {{sc_snippets}}]',
 
     summarizerSystemPrompt:
     'You are a precise narrative-state tracker. You output only the summary line — no preamble, no commentary, no markdown.',
@@ -166,6 +169,43 @@ function log(...args) {
     if (getSettings().debugMode) console.log(LOG_PREFIX, ...args);
 }
 
+function resolvePromptMacros(text) {
+    try {
+        const ctx = SillyTavern.getContext();
+
+        if (typeof ctx.substituteParams === 'function') {
+            return ctx.substituteParams(text);
+        }
+
+        if (typeof window.substituteParams === 'function') {
+            return window.substituteParams(text);
+        }
+    } catch (e) {
+        log('Could not resolve native macros:', e);
+    }
+
+    log('Native macro resolution unavailable in this runtime; leaving prompt text unchanged.');
+    return text;
+}
+
+function pruneLayerToLimit(layer, limit) {
+    if (!Array.isArray(layer) || limit < 0) return 0;
+    const overflow = Math.max(0, layer.length - limit);
+    if (overflow === 0) return 0;
+    layer.splice(0, overflow);
+    return overflow;
+}
+
+function getTotalPrunedCount(store) {
+    return Number(store?.prunedSnippetCount || 0);
+}
+
+function estimateTokenCount(text) {
+    const normalized = String(text || '').trim();
+    if (!normalized) return 0;
+    return Math.max(1, Math.ceil(normalized.length / 4));
+}
+
 function getSettings() {
     const { extensionSettings } = SillyTavern.getContext();
     if (!extensionSettings[MODULE_NAME]) {
@@ -190,11 +230,15 @@ function getChatStore() {
             layers: [],
             summarizedUpTo: -1,
             ghostedIndices: [],           // Track which messages WE ghosted
+            prunedSnippetCount: 0,        // Count of snippets dropped due to retention mode
         };
     }
     // Migration: add ghostedIndices if missing from older saves
     if (!chatMetadata[MODULE_NAME].ghostedIndices) {
         chatMetadata[MODULE_NAME].ghostedIndices = [];
+    }
+    if (typeof chatMetadata[MODULE_NAME].prunedSnippetCount !== 'number') {
+        chatMetadata[MODULE_NAME].prunedSnippetCount = 0;
     }
     return chatMetadata[MODULE_NAME];
 }
@@ -558,10 +602,14 @@ function abortSummarization() {
 async function callSummarizer(storyTxt, contextStr) {
     const s = getSettings();
 
-    const prompt = s.summarizerUserPrompt
+    let prompt = s.summarizerUserPrompt
     .replace('{{player_name}}', getPlayerName())
     .replace('{{context_str}}', contextStr || '(none yet)')
     .replace('{{story_txt}}', storyTxt);
+
+    if (s.resolveNativeMacros) {
+        prompt = resolvePromptMacros(prompt);
+    }
 
     log('── Summarizer Call ──');
     log('Context str length:', contextStr.length, 'chars');
@@ -1022,13 +1070,26 @@ async function maybePromoteLayer(layerIndex) {
     const s = getSettings();
     const store = getChatStore();
 
-    if (layerIndex >= s.maxLayers - 1) {
-        log(`Max layer depth (${s.maxLayers}) reached.`);
-        return;
-    }
-
     const layer = store.layers[layerIndex];
     if (!layer || layer.length <= s.snippetsPerLayer) return;
+
+    if (layerIndex >= s.maxLayers - 1) {
+        if (s.retentionMode === 'drop_oldest') {
+            const pruned = pruneLayerToLimit(layer, s.snippetsPerLayer);
+            if (pruned > 0) {
+                store.prunedSnippetCount = getTotalPrunedCount(store) + pruned;
+                log(`Pruned ${pruned} oldest snippet(s) from Layer ${layerIndex} at max depth (${s.maxLayers}).`);
+                toastr.info(
+                    `Pruned ${pruned} oldest summary snippet${pruned > 1 ? 's' : ''} from deepest layer to stay within retention limit.`,
+                    'Summaryception',
+                    { timeOut: 2500 }
+                );
+            }
+        } else {
+            log(`Max layer depth (${s.maxLayers}) reached.`);
+        }
+        return;
+    }
 
     log(`Layer ${layerIndex}: ${layer.length} snippets > limit ${s.snippetsPerLayer} → promoting`);
 
@@ -1093,31 +1154,69 @@ async function maybePromoteLayer(layerIndex) {
 
 // ─── Core: Assemble Full Summary Block ──────────────────────────────
 
+function collectInjectionCandidates(store) {
+    const candidates = [];
+
+    if (!store.layers || store.layers.every(l => !l || l.length === 0)) return candidates;
+
+    // Prefer recent, detailed memory first: Layer 0 newest→oldest, then deeper layers newest→oldest.
+    for (let i = 0; i < store.layers.length; i++) {
+        const layer = store.layers[i];
+        if (!layer || layer.length === 0) continue;
+        for (let j = layer.length - 1; j >= 0; j--) {
+            const sn = layer[j];
+            if (!sn?.text) continue;
+            candidates.push({
+                text: sn.text,
+                tokenEstimate: estimateTokenCount(sn.text),
+            });
+        }
+    }
+
+    return candidates;
+}
+
+function selectSnippetsForInjection(candidates, maxTokens) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return [];
+
+    if (!maxTokens || maxTokens <= 0) {
+        return [...candidates].reverse().map(c => c.text);
+    }
+
+    const selected = [];
+    let used = 0;
+
+    for (const candidate of candidates) {
+        const cost = candidate.tokenEstimate || estimateTokenCount(candidate.text);
+
+        // Always allow at least one full snippet so nothing gets cut mid-thought.
+        if (selected.length === 0 && cost > maxTokens) {
+            selected.push(candidate.text);
+            break;
+        }
+
+        if (selected.length > 0 && used + cost > maxTokens) {
+            break;
+        }
+
+        selected.push(candidate.text);
+        used += cost;
+    }
+
+    return selected.reverse();
+}
+
 function assembleSummaryBlock() {
     const s = getSettings();
     const store = getChatStore();
 
-    if (!store.layers || store.layers.every(l => !l || l.length === 0)) return '';
+    const candidates = collectInjectionCandidates(store);
+    if (candidates.length === 0) return '';
 
-    const snippets = [];
-
-    for (let i = store.layers.length - 1; i >= 1; i--) {
-        const layer = store.layers[i];
-        if (!layer || layer.length === 0) continue;
-        for (const sn of layer) {
-            snippets.push(sn.text);
-        }
-    }
-
-    if (store.layers[0] && store.layers[0].length > 0) {
-        for (const sn of store.layers[0]) {
-            snippets.push(sn.text);
-        }
-    }
-
+    const snippets = selectSnippetsForInjection(candidates, s.maxInjectionTokens || 0);
     if (snippets.length === 0) return '';
 
-    return s.injectionTemplate.replace('{{summary}}', snippets.join(' '));
+    return s.injectionTemplate.replace('{{sc_snippets}}', snippets.join(' '));
 }
 
 // ─── Injection via setExtensionPrompt ────────────────────────────────
@@ -1269,6 +1368,8 @@ function updateUI() {
         $('#sc_snippets_per_promotion_val').text(s.snippetsPerPromotion);
         $('#sc_max_layers').val(s.maxLayers);
         $('#sc_max_layers_val').text(s.maxLayers);
+        $('#sc_resolve_native_macros').prop('checked', s.resolveNativeMacros);
+        $('#sc_retention_mode').val(s.retentionMode || 'preserve');
         $('#sc_injection_template').val(s.injectionTemplate);
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
@@ -1304,6 +1405,12 @@ function updateUI() {
 
         let statsHtml = '';
         statsHtml += `<div class="sc-layer-stat">👻 <strong>${ghostedCount}</strong> messages ghosted (hidden from LLM, visible to you)</div>`;
+        statsHtml += `<div class="sc-layer-stat">🧩 Native macro resolution: <strong>${s.resolveNativeMacros ? 'ON' : 'OFF'}</strong></div>`;
+        statsHtml += `<div class="sc-layer-stat">🗃️ Retention mode: <strong>${escapeHtml(s.retentionMode || 'preserve')}</strong></div>`;
+        statsHtml += `<div class="sc-layer-stat">🎯 Max injection tokens: <strong>${s.maxInjectionTokens > 0 ? s.maxInjectionTokens : 'Unlimited'}</strong></div>`;
+        if (getTotalPrunedCount(store) > 0) {
+            statsHtml += `<div class="sc-layer-stat">🗑️ Pruned oldest snippets: <strong>${getTotalPrunedCount(store)}</strong></div>`;
+        }
         if (store.layers) {
             for (let i = store.layers.length - 1; i >= 0; i--) {
                 const layer = store.layers[i];
@@ -1559,6 +1666,13 @@ function bindUIEvents() {
         saveSettings();
     });
 
+    $('#sc_max_injection_tokens').on('input', function () {
+        getSettings().maxInjectionTokens = parseInt($(this).val(), 10) || 0;
+        saveSettings();
+        updateInjection();
+        updateUI();
+    });
+
     $('#sc_strip_patterns').on('change', function () {
         const lines = $(this).val().split('\n').map(l => l.trim()).filter(l => l.length > 0);
         getSettings().stripPatterns = lines;
@@ -1598,6 +1712,17 @@ function bindUIEvents() {
     $('#sc_debug_mode').on('change', function () {
         getSettings().debugMode = $(this).prop('checked');
         saveSettings();
+    });
+
+    $('#sc_resolve_native_macros').on('change', function () {
+        getSettings().resolveNativeMacros = $(this).prop('checked');
+        saveSettings();
+    });
+
+    $('#sc_retention_mode').on('change', function () {
+        getSettings().retentionMode = $(this).val() || 'preserve';
+        saveSettings();
+        updateUI();
     });
 
     $('#sc_repair').on('click', async function () {
@@ -1668,6 +1793,7 @@ function bindUIEvents() {
         store.layers.length = 0;
         store.summarizedUpTo = -1;
         store.ghostedIndices = [];
+        store.prunedSnippetCount = 0;
 
         const { chatMetadata } = SillyTavern.getContext();
         chatMetadata[MODULE_NAME] = store;
@@ -1770,6 +1896,7 @@ function bindUIEvents() {
                 store.layers = data.layers;
                 store.summarizedUpTo = data.summarizedUpTo ?? -1;
                 store.ghostedIndices = data.ghostedIndices || [];
+                store.prunedSnippetCount = data.prunedSnippetCount || 0;
 
                 if (store.summarizedUpTo >= 0) {
                     await ghostMessagesUpTo(store.summarizedUpTo);

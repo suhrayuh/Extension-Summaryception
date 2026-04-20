@@ -294,6 +294,36 @@
 
                     <hr class="sc-divider" />
 
+                    <!-- Retention / Macro Behavior -->
+                    <h4 class="sc-section-title">🧠 Retention & Prompt Resolution</h4>
+
+                    <div class="sc-row">
+                        <label class="checkbox_label" for="sc_resolve_native_macros">
+                            <input type="checkbox" id="sc_resolve_native_macros" />
+                            <span>Resolve native SillyTavern macros in summarizer prompt</span>
+                            <small class="sc-hint">Runs the summarizer prompt through SillyTavern macro resolution after Summaryception inserts <code>{{player_name}}</code>, <code>{{context_str}}</code>, and <code>{{story_txt}}</code>. Useful for things like lorebook outlets.</small>
+                        </label>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_retention_mode">
+                            <span>Deepest Layer Retention Mode</span>
+                            <small class="sc-hint">Choose what happens when the deepest allowed layer exceeds its snippet limit and cannot promote any further.</small>
+                        </label>
+                        <select id="sc_retention_mode" class="text_pole">
+                            <option value="preserve">Preserve overflow (original behavior)</option>
+                            <option value="drop_oldest">Drop oldest snippets to stay within limit</option>
+                        </select>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_max_injection_tokens">
+                            <span>Max Injection Tokens</span>
+                            <small class="sc-hint">Only inject the most recent complete snippets up to this estimated token budget. 0 = unlimited. Snippets are never cut mid-text.</small>
+                        </label>
+                        <input id="sc_max_injection_tokens" type="number" class="text_pole" min="0" step="250" value="0" placeholder="0 = unlimited" />
+                    </div>
+ 
                     <!-- Prompts -->
                     <h4 class="sc-section-title">✏️ Summarizer Prompts</h4>
 
@@ -328,7 +358,7 @@
                     <div class="sc-row">
                         <label for="sc_injection_template">
                             <span>Injection Wrapper Template</span>
-                            <small class="sc-hint">Wraps the assembled block. Use <code>{{summary}}</code> for the combined text.</small>
+                            <small class="sc-hint">Wraps the assembled block. Use <code>{{sc_snippets}}</code> for the combined text.</small>
                         </label>
                         <textarea id="sc_injection_template" class="text_pole sc-textarea" rows="3"></textarea>
                     </div>
