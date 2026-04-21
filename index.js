@@ -33,6 +33,8 @@ const defaultSettings = Object.freeze({
     retentionMode: 'preserve',      // 'preserve' | 'drop_oldest'
     maxInjectionTokens: 0,          // 0 = unlimited, inject all snippets
     injectionTemplate: '[Summary of past events: {{sc_snippets}}]',
+    firstSnippetEnabled: true,
+    stripTrackers: true,
 
     summarizerSystemPrompt:
     'You are a precise narrative-state tracker. You output only the summary line — no preamble, no commentary, no markdown.',
@@ -49,6 +51,22 @@ const defaultSettings = Object.freeze({
     Exclude anything insubstantial, fluff, atmospheric details, or events already covered in Prior Context.
     Skip any passages that are empty, unclear, or lack significant content.
     Write in short phrases, no more than 20; output must be a single line:`,
+
+    firstSnippetSystemPrompt:
+    'You are a precise narrative-state tracker. For the very first memory snippet in a chat, establish the scene clearly before compressing details. Output only the summary line — no preamble, no commentary, no markdown.',
+
+    firstSnippetUserPrompt:
+    `<player_name>{{player_name}}</player_name>
+    <prior_context>{{context_str}}</prior_context>
+    <passage_in_question>{{story_txt}}</passage_in_question>
+
+    This is the first summary snippet for a chat. Build an opening memory anchor that establishes the scene before continuing details.
+
+    Include, when present and inferable from the passage: who the core characters are, their relationship or role toward each other, where this scene is taking place, what immediately led to this moment, the central conflict or situation, and any major emotional or physical stakes that must be remembered.
+
+    After establishing that opening frame, preserve the most important concrete developments from the passage.
+    Exclude trivial repetition, ornamental prose, and low-importance detail.
+    Output must remain a single compact paragraph or line that is denser than prose but more scene-establishing than later snippets:`,
 
     promptPreset: 'narrative',  // 'narrative' | 'gamestate' | 'custom'
     pauseSummarization: false,  // true = stop processing, keep injecting
@@ -231,6 +249,7 @@ function getChatStore() {
             summarizedUpTo: -1,
             ghostedIndices: [],           // Track which messages WE ghosted
             prunedSnippetCount: 0,        // Count of snippets dropped due to retention mode
+            hasCreatedInitialSnippet: false,
         };
     }
     // Migration: add ghostedIndices if missing from older saves
@@ -239,6 +258,11 @@ function getChatStore() {
     }
     if (typeof chatMetadata[MODULE_NAME].prunedSnippetCount !== 'number') {
         chatMetadata[MODULE_NAME].prunedSnippetCount = 0;
+    }
+    if (typeof chatMetadata[MODULE_NAME].hasCreatedInitialSnippet !== 'boolean') {
+        const layerZeroHasSnippets = Array.isArray(chatMetadata[MODULE_NAME].layers?.[0])
+            && chatMetadata[MODULE_NAME].layers[0].length > 0;
+        chatMetadata[MODULE_NAME].hasCreatedInitialSnippet = layerZeroHasSnippets || (chatMetadata[MODULE_NAME].summarizedUpTo ?? -1) >= 0;
     }
     return chatMetadata[MODULE_NAME];
 }
@@ -426,7 +450,22 @@ function getVisibleAssistantTurns(chat) {
  * Skips messages that are hidden (by user or system) UNLESS they were
  * hidden by Summaryception (sc_ghosted). Also skips empty messages.
  */
+function stripTrackerBlocks(text) {
+    // Strip ```disp / ```sim / ```json code fences (SimTracker and similar tracker extensions),
+    // with or without <div style="display: none;"> wrapper.
+    let cleaned = text;
+    const fenceTypes = 'disp|sim|json';
+    // Variant 1: <div style="display: none;">...```<type>...```...</div>
+    cleaned = cleaned.replace(new RegExp(`<div\\s+style\\s*=\\s*["']display\\s*:\\s*none;?\\s*["']\\s*>[\\s\\S]*?\`\`\`(?:${fenceTypes})[\\s\\S]*?\`\`\`[\\s\\S]*?<\\/div>`, 'gi'), '');
+    // Variant 2: bare ```<type>...``` (no div wrapper)
+    cleaned = cleaned.replace(new RegExp(`\`\`\`(?:${fenceTypes})[\\s\\S]*?\`\`\``, 'g'), '');
+    // Variant 3: orphaned <div style="display: none;">...</div> that may remain after fence removal
+    cleaned = cleaned.replace(/<div\s+style\s*=\s*["']display\s*:\s*none;?\s*["']\s*>[\s\S]*?<\/div>/gi, '');
+    return cleaned.trim();
+}
+
 function buildPassageFromRange(chat, startIdx, endIdx) {
+    const s = getSettings();
     const lines = [];
     for (let i = startIdx; i <= endIdx; i++) {
         const m = chat[i];
@@ -440,7 +479,9 @@ function buildPassageFromRange(chat, startIdx, endIdx) {
         if (isUserHidden) continue;
 
         const speaker = m.is_user ? 'Player' : 'Assistant';
-        lines.push(`${speaker}: ${m.mes.trim()}`);
+        const messageText = s.stripTrackers ? stripTrackerBlocks(m.mes.trim()) : m.mes.trim();
+        if (!messageText) continue;
+        lines.push(`${speaker}: ${messageText}`);
     }
     return lines.join('\n');
 }
@@ -588,6 +629,7 @@ function cleanSummarizerOutput(raw) {
 let isSummarizing = false;
 let catchupDismissed = false;
 let currentAbortController = null;
+let temporarilyUnghostedIndices = [];
 
 function abortSummarization() {
     if (currentAbortController) {
@@ -599,19 +641,38 @@ function abortSummarization() {
 
 // ─── Core: LLM Summarization with Retry ──────────────────────────────
 
-async function callSummarizer(storyTxt, contextStr) {
-    const s = getSettings();
+function shouldUseFirstSnippetPrompt(store) {
+    if (!store) return false;
+    if (store.hasCreatedInitialSnippet === true) return false;
 
-    let prompt = s.summarizerUserPrompt
-    .replace('{{player_name}}', getPlayerName())
-    .replace('{{context_str}}', contextStr || '(none yet)')
-    .replace('{{story_txt}}', storyTxt);
+    const hasLayerZeroSnippet = Array.isArray(store.layers?.[0]) && store.layers[0].length > 0;
+    const hasSummarizedHistory = Number(store.summarizedUpTo ?? -1) >= 0;
 
-    if (s.resolveNativeMacros) {
+    return !hasLayerZeroSnippet && !hasSummarizedHistory;
+}
+
+function buildSummarizerPrompt(template, storyTxt, contextStr) {
+    let prompt = (template || '')
+        .replace('{{player_name}}', getPlayerName())
+        .replace('{{context_str}}', contextStr || '(none yet)')
+        .replace('{{story_txt}}', storyTxt);
+
+    if (getSettings().resolveNativeMacros) {
         prompt = resolvePromptMacros(prompt);
     }
 
+    return prompt;
+}
+
+async function callSummarizer(storyTxt, contextStr, options = {}) {
+    const s = getSettings();
+    const useFirstSnippetPrompt = Boolean(options.useFirstSnippetPrompt && s.firstSnippetEnabled);
+    const promptTemplate = useFirstSnippetPrompt ? s.firstSnippetUserPrompt : s.summarizerUserPrompt;
+    const systemPrompt = useFirstSnippetPrompt ? s.firstSnippetSystemPrompt : s.summarizerSystemPrompt;
+    const prompt = buildSummarizerPrompt(promptTemplate, storyTxt, contextStr);
+
     log('── Summarizer Call ──');
+    log('Mode:', useFirstSnippetPrompt ? 'first-snippet' : 'default');
     log('Context str length:', contextStr.length, 'chars');
     log('Story txt length:', storyTxt.length, 'chars');
 
@@ -639,7 +700,7 @@ async function callSummarizer(storyTxt, contextStr) {
 
                 const timeoutMs = 120000;
                 const result = await Promise.race([
-                    sendSummarizerRequest(s, s.summarizerSystemPrompt, prompt),
+                    sendSummarizerRequest(s, systemPrompt, prompt),
                                                   new Promise((_, reject) => {
                                                       const timer = setTimeout(() => reject(new Error('Request timed out after 120s')), timeoutMs);
                                                       signal.addEventListener('abort', () => {
@@ -817,13 +878,38 @@ async function summarizeOneBatch(visibleTurns) {
         if (!storyTxt.trim()) return false;
 
         const contextStr = buildFullContext(0);
+        const isFirstSnippet = shouldUseFirstSnippetPrompt(store);
 
-        toastr.info(`Summarizing ${batch.length} turn${batch.length > 1 ? 's' : ''}…`, 'Summaryception', {
-            timeOut: 3000,
-            progressBar: true,
+        log('First-snippet eligibility:', {
+            hasCreatedInitialSnippet: store.hasCreatedInitialSnippet,
+            summarizedUpTo: store.summarizedUpTo,
+            layerZeroCount: Array.isArray(store.layers?.[0]) ? store.layers[0].length : 0,
+            isFirstSnippet,
         });
 
-        const summary = await callSummarizer(storyTxt, contextStr);
+        toastr.info(
+            isFirstSnippet
+                ? `Creating first summary snippet from turns ${passageStart}–${endIdx}…`
+                : `Summarizing ${batch.length} turn${batch.length > 1 ? 's' : ''}…`,
+            'Summaryception',
+            {
+                timeOut: 3000,
+                progressBar: true,
+            }
+        );
+
+        if (isFirstSnippet && s.firstSnippetEnabled) {
+            log('Using first-snippet prompt path for this chat.');
+            toastr.info(
+                'First-snippet protocol active: using the dedicated first-snippet prompt instead of the regular summarizer user prompt.',
+                'Summaryception',
+                { timeOut: 3500 }
+            );
+        }
+
+        const summary = await callSummarizer(storyTxt, contextStr, {
+            useFirstSnippetPrompt: isFirstSnippet,
+        });
 
         if (!summary) {
             log('Summarization failed for batch, leaving turns intact for next attempt.');
@@ -835,6 +921,10 @@ async function summarizeOneBatch(visibleTurns) {
             turnRange: [passageStart, endIdx],
             timestamp: Date.now(),
         });
+
+        if (isFirstSnippet) {
+            store.hasCreatedInitialSnippet = true;
+        }
 
         store.summarizedUpTo = Math.max(store.summarizedUpTo, endIdx);
         await ghostMessagesUpTo(endIdx);
@@ -881,8 +971,15 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
     if (!storyTxt.trim()) return false;
 
     const contextStr = buildFullContext(0);
+    const isFirstSnippet = shouldUseFirstSnippetPrompt(store);
 
-    const summary = await callSummarizer(storyTxt, contextStr);
+    if (isFirstSnippet && s.firstSnippetEnabled) {
+        log('Catchup path: using first-snippet prompt for initial batch.');
+    }
+
+    const summary = await callSummarizer(storyTxt, contextStr, {
+        useFirstSnippetPrompt: isFirstSnippet,
+    });
 
     if (!summary) {
         log('Summarization failed for batch, leaving turns intact for next attempt.');
@@ -894,6 +991,10 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
         turnRange: [passageStart, endIdx],
         timestamp: Date.now(),
     });
+
+    if (isFirstSnippet) {
+        store.hasCreatedInitialSnippet = true;
+    }
 
     store.summarizedUpTo = Math.max(store.summarizedUpTo, endIdx);
 
@@ -1268,6 +1369,7 @@ function onMessageReceived(messageIndex) {
 function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
+    temporarilyUnghostedIndices = [];
     setTimeout(() => {
         updateInjection();
         updateUI();
@@ -1319,6 +1421,7 @@ function registerSlashCommands() {
                 store.layers.length = 0;
                 store.summarizedUpTo = -1;
                 store.ghostedIndices = [];
+                store.hasCreatedInitialSnippet = false;
 
                 const { chatMetadata } = SillyTavern.getContext();
                 chatMetadata[MODULE_NAME] = store;
@@ -1358,6 +1461,7 @@ function updateUI() {
 
         $('#sc_enabled').prop('checked', s.enabled);
         $('#sc_pause_summarization').prop('checked', s.pauseSummarization);
+        $('#sc_first_snippet_enabled').prop('checked', s.firstSnippetEnabled !== false);
         $('#sc_verbatim_turns').val(s.verbatimTurns);
         $('#sc_verbatim_turns_val').text(s.verbatimTurns);
         $('#sc_turns_per_summary').val(s.turnsPerSummary);
@@ -1369,10 +1473,13 @@ function updateUI() {
         $('#sc_max_layers').val(s.maxLayers);
         $('#sc_max_layers_val').text(s.maxLayers);
         $('#sc_resolve_native_macros').prop('checked', s.resolveNativeMacros);
+        $('#sc_strip_trackers').prop('checked', s.stripTrackers !== false);
         $('#sc_retention_mode').val(s.retentionMode || 'preserve');
         $('#sc_injection_template').val(s.injectionTemplate);
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
+        $('#sc_first_snippet_system_prompt').val(s.firstSnippetSystemPrompt);
+        $('#sc_first_snippet_user_prompt').val(s.firstSnippetUserPrompt);
         // ── Prompt preset migration & sync ──
         // Migration: existing users with the old game-state default get upgraded to narrative.
         // Users who customized their prompt get marked as 'custom'.
@@ -1403,8 +1510,18 @@ function updateUI() {
             ghostedCount = chat.filter(m => m.extra?.sc_ghosted).length;
         } catch (e) { /* no chat loaded */ }
 
+        $('#sc_reveal_ghosted').html(
+            temporarilyUnghostedIndices.length > 0
+                ? '<i class="fa-solid fa-eye-slash"></i> Rehide Ghosted Messages'
+                : '<i class="fa-solid fa-eye"></i> Reveal Ghosted Messages'
+        );
+
+        const firstSnippetPending = shouldUseFirstSnippetPrompt(store);
+
         let statsHtml = '';
         statsHtml += `<div class="sc-layer-stat">👻 <strong>${ghostedCount}</strong> messages ghosted (hidden from LLM, visible to you)</div>`;
+        statsHtml += `<div class="sc-layer-stat">🪄 First snippet protocol: <strong>${s.firstSnippetEnabled !== false ? 'ON' : 'OFF'}</strong></div>`;
+        statsHtml += `<div class="sc-layer-stat">🧭 First snippet status: <strong>${firstSnippetPending ? 'Next Layer 0 snippet will use the first-snippet prompt' : 'Already consumed for this chat'}</strong></div>`;
         statsHtml += `<div class="sc-layer-stat">🧩 Native macro resolution: <strong>${s.resolveNativeMacros ? 'ON' : 'OFF'}</strong></div>`;
         statsHtml += `<div class="sc-layer-stat">🗃️ Retention mode: <strong>${escapeHtml(s.retentionMode || 'preserve')}</strong></div>`;
         statsHtml += `<div class="sc-layer-stat">🎯 Max injection tokens: <strong>${s.maxInjectionTokens > 0 ? s.maxInjectionTokens : 'Unlimited'}</strong></div>`;
@@ -1611,13 +1728,17 @@ function updateSnippetBrowser() {
         if (layer) {
             layer.splice(snippetIdx, 1);
 
-            if (store.layers[0] && store.layers[0].length > 0) {
+            const layerZeroHasSnippets = store.layers[0] && store.layers[0].length > 0;
+
+            if (layerZeroHasSnippets) {
                 const maxEnd = Math.max(...store.layers[0]
                 .filter(sn => sn.turnRange)
                 .map(sn => sn.turnRange[1]));
                 store.summarizedUpTo = maxEnd;
             } else {
                 store.summarizedUpTo = -1;
+                store.hasCreatedInitialSnippet = false;
+                log('Reset first-snippet lifecycle flag because no Layer 0 snippets remain after deletion.');
             }
 
             await saveChatStore();
@@ -1666,9 +1787,18 @@ function bindUIEvents() {
         saveSettings();
     });
 
-    $('#sc_max_injection_tokens').on('input', function () {
-        getSettings().maxInjectionTokens = parseInt($(this).val(), 10) || 0;
+    $('#sc_first_snippet_enabled').on('change', function () {
+        getSettings().firstSnippetEnabled = $(this).prop('checked');
         saveSettings();
+        updateUI();
+    });
+
+    $('#sc_max_injection_tokens').on('input', function () {
+        const nextValue = parseInt($(this).val(), 10) || 0;
+        const s = getSettings();
+        s.maxInjectionTokens = nextValue;
+        saveSettings();
+        $(this).val(nextValue);
         updateInjection();
         updateUI();
     });
@@ -1700,6 +1830,8 @@ function bindUIEvents() {
     const textareas = [
         { id: '#sc_injection_template', key: 'injectionTemplate' },
         { id: '#sc_summarizer_system_prompt', key: 'summarizerSystemPrompt' },
+        { id: '#sc_first_snippet_system_prompt', key: 'firstSnippetSystemPrompt' },
+        { id: '#sc_first_snippet_user_prompt', key: 'firstSnippetUserPrompt' },
     ];
 
     for (const ta of textareas) {
@@ -1719,10 +1851,105 @@ function bindUIEvents() {
         saveSettings();
     });
 
+    $('#sc_strip_trackers').on('change', function () {
+        getSettings().stripTrackers = $(this).prop('checked');
+        saveSettings();
+    });
+
     $('#sc_retention_mode').on('change', function () {
         getSettings().retentionMode = $(this).val() || 'preserve';
         saveSettings();
         updateUI();
+    });
+
+    $('#sc_reveal_ghosted').on('click', async function () {
+        const { chat } = SillyTavern.getContext();
+        const store = getChatStore();
+        const btn = $(this);
+
+        if (temporarilyUnghostedIndices.length > 0) {
+            let rehidden = 0;
+            btn.prop('disabled', true);
+            try {
+                for (const idx of temporarilyUnghostedIndices) {
+                    const msg = chat[idx];
+                    if (!msg) continue;
+                    if (!msg.extra) msg.extra = {};
+                    if (msg.extra.sc_ghosted) continue;
+
+                    msg.extra.sc_ghosted = true;
+                    if (!store.ghostedIndices.includes(idx)) {
+                        store.ghostedIndices.push(idx);
+                    }
+
+                    try {
+                        await SillyTavern.getContext().executeSlashCommandsWithOptions(`/hide ${idx}`, { showOutput: false });
+                        rehidden++;
+                    } catch (e) {
+                        log(`Failed to rehide message ${idx}:`, e);
+                    }
+                }
+
+                await saveChatStore();
+                try {
+                    const ctx = SillyTavern.getContext();
+                    if (ctx.saveChat) await ctx.saveChat();
+                } catch (e) {
+                    log('Could not save chat:', e);
+                }
+
+                temporarilyUnghostedIndices = [];
+                updateInjection();
+                updateUI();
+                toastr.success(`Rehid ${rehidden} Summaryception ghosted message${rehidden === 1 ? '' : 's'}.`, 'Summaryception', { timeOut: 3000 });
+            } finally {
+                btn.prop('disabled', false);
+            }
+            return;
+        }
+
+        const toReveal = Array.isArray(store.ghostedIndices) ? [...store.ghostedIndices] : [];
+        if (toReveal.length === 0) {
+            toastr.info('No Summaryception ghosted messages to reveal in this chat.', 'Summaryception', { timeOut: 3000 });
+            return;
+        }
+
+        let revealed = 0;
+        btn.prop('disabled', true);
+        try {
+            for (const idx of toReveal) {
+                if (idx < 0 || idx >= chat.length) continue;
+                const msg = chat[idx];
+                if (!msg) continue;
+
+                if (msg?.extra?.sc_ghosted) {
+                    delete msg.extra.sc_ghosted;
+                }
+
+                try {
+                    await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${idx}`, { showOutput: false });
+                    revealed++;
+                    temporarilyUnghostedIndices.push(idx);
+                } catch (e) {
+                    log(`Failed to temporarily unhide message ${idx}:`, e);
+                }
+            }
+
+            store.ghostedIndices = store.ghostedIndices.filter(idx => !temporarilyUnghostedIndices.includes(idx));
+            await saveChatStore();
+            try {
+                const ctx = SillyTavern.getContext();
+                if (ctx.saveChat) await ctx.saveChat();
+            } catch (e) {
+                log('Could not save chat:', e);
+            }
+
+            updateInjection();
+            updateUI();
+            toastr.success(`Temporarily revealed ${revealed} Summaryception ghosted message${revealed === 1 ? '' : 's'}. Click again to rehide them after your OOC summary pass.`, 'Summaryception', { timeOut: 5000 });
+        } finally {
+            btn.prop('disabled', false);
+        }
     });
 
     $('#sc_repair').on('click', async function () {
@@ -1794,6 +2021,7 @@ function bindUIEvents() {
         store.summarizedUpTo = -1;
         store.ghostedIndices = [];
         store.prunedSnippetCount = 0;
+        store.hasCreatedInitialSnippet = false;
 
         const { chatMetadata } = SillyTavern.getContext();
         chatMetadata[MODULE_NAME] = store;
@@ -1897,6 +2125,9 @@ function bindUIEvents() {
                 store.summarizedUpTo = data.summarizedUpTo ?? -1;
                 store.ghostedIndices = data.ghostedIndices || [];
                 store.prunedSnippetCount = data.prunedSnippetCount || 0;
+                store.hasCreatedInitialSnippet = typeof data.hasCreatedInitialSnippet === 'boolean'
+                    ? data.hasCreatedInitialSnippet
+                    : ((data.summarizedUpTo ?? -1) >= 0 || (Array.isArray(data.layers?.[0]) && data.layers[0].length > 0));
 
                 if (store.summarizedUpTo >= 0) {
                     await ghostMessagesUpTo(store.summarizedUpTo);

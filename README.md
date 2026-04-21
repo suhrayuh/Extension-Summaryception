@@ -18,6 +18,12 @@ This fork adds a small set of practical changes aimed at long-form SillyTavern r
   - Adds `maxInjectionTokens` so only the newest complete summary snippets that fit within a token budget are injected. In case maybe you don't want the *entirety* of your roleplay sent every turn, even if Summaryception is perfectly capable of doing that in a token-friendly manner.
 - **Safer internal injection placeholder**
   - Renames Summaryception's internal wrapper placeholder from `{{summary}}` to `{{sc_snippets}}` to avoid collisions with SillyTavern's built-in summary macro.
+- **First-snippet protocol**
+  - I noticed a problem where the first snippet in a chat is always super vague, not giving enough context as to who, what, when, where, and why for the beginning of the roleplay. So I implemented first-snippet protocol. When a chat has no prior summaries, the first Layer 0 snippet uses a dedicated scene-establishing prompt instead of the normal compact delta prompt. Both the system and user prompts for first-snippet mode are fully editable in the UI, and first-snippet protocol is an optional toggle. The flag resets automatically when you clear memory or delete all Layer 0 snippets.
+- **Temporary reveal / rehide ghosted messages**
+  - A toggle button in the action row lets you temporarily unhide all Summaryception-ghosted messages so the LLM can see them for a request (mainly just added this bc i do OOC summaries and got tired of manually unhiding and rehiding messages), then rehide them with one click when you're done.
+- **SimTracker code fence stripping**
+  - Optionally strips Simtracker blocks (or just trackers wrapped with sim, json, or disp, with or without `<div style="display: none;">` wrappers) from message text before it reaches the summarizer, preventing tracker JSON from bloating summary requests. Again just added for personal preference because the trackers just make the requests more expensive when present in {{context_str}}. Enabled by default; toggle via "Strip tracker blocks from sent context" in settings.
  
 All settings added are optional! I left the option for default settings from the original if those are preferred.
 

@@ -31,6 +31,9 @@
                 <button id="sc_stop_summarize" class="menu_button menu_button_danger">
                     <i class="fa-solid fa-stop"></i> Stop
                 </button>
+                <button id="sc_reveal_ghosted" class="menu_button">
+                    <i class="fa-solid fa-eye"></i> Reveal Ghosted Messages
+                </button>
                 <button id="sc_repair" class="menu_button">
                     <i class="fa-solid fa-wrench"></i> Repair Orphans
                 </button>
@@ -298,10 +301,26 @@
                     <h4 class="sc-section-title">🧠 Retention & Prompt Resolution</h4>
 
                     <div class="sc-row">
+                        <label class="checkbox_label" for="sc_first_snippet_enabled">
+                            <input type="checkbox" id="sc_first_snippet_enabled" />
+                            <span>Use special first-snippet protocol</span>
+                            <small class="sc-hint">When a chat has no snippets yet, the first Layer 0 summary uses a more scene-establishing prompt before later summaries return to compact delta mode.</small>
+                        </label>
+                    </div>
+
+                    <div class="sc-row">
                         <label class="checkbox_label" for="sc_resolve_native_macros">
                             <input type="checkbox" id="sc_resolve_native_macros" />
                             <span>Resolve native SillyTavern macros in summarizer prompt</span>
                             <small class="sc-hint">Runs the summarizer prompt through SillyTavern macro resolution after Summaryception inserts <code>{{player_name}}</code>, <code>{{context_str}}</code>, and <code>{{story_txt}}</code>. Useful for things like lorebook outlets.</small>
+                        </label>
+                    </div>
+
+                    <div class="sc-row">
+                        <label class="checkbox_label" for="sc_strip_trackers">
+                            <input type="checkbox" id="sc_strip_trackers" />
+                            <span>Strip tracker blocks from sent context</span>
+                            <small class="sc-hint">Removes <code>```disp</code>, <code>```sim</code>, and <code>```json</code> code fences (and their <code>&lt;div style="display:none"&gt;</code> wrappers) from message text before summarization. Prevents tracker JSON from bloating summary requests.</small>
                         </label>
                     </div>
 
@@ -353,6 +372,24 @@
                             </small>
                         </label>
                         <textarea id="sc_summarizer_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_first_snippet_system_prompt">
+                            <span>First-Snippet System Prompt</span>
+                            <small class="sc-hint">Used only for the first Layer 0 snippet in a chat, replacing the regular summarizer system prompt for that one request.</small>
+                        </label>
+                        <textarea id="sc_first_snippet_system_prompt" class="text_pole sc-textarea" rows="3"></textarea>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_first_snippet_user_prompt">
+                            <span>First-Snippet User Prompt</span>
+                            <small class="sc-hint">
+                                Used only for the first Layer 0 snippet in a chat, instead of the regular user prompt. Variables: <code>{{player_name}}</code> <code>{{context_str}}</code> <code>{{story_txt}}</code>
+                            </small>
+                        </label>
+                        <textarea id="sc_first_snippet_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
                     </div>
 
                     <div class="sc-row">
