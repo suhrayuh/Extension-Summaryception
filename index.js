@@ -19,6 +19,7 @@ import {
 
 const MODULE_NAME = 'summaryception';
 const LOG_PREFIX = '[Summaryception]';
+// const TRACE_MODE = true;  // ultra-verbose logging
 
 // ─── Default Settings ────────────────────────────────────────────────
 
@@ -81,6 +82,7 @@ const defaultSettings = Object.freeze({
     ],
 
     debugMode: false,
+    traceMode: false,
 
     // ─── Connection Settings ─────────────────────────────────────
     connectionSource: 'default',          // 'default' | 'profile' | 'ollama' | 'openai'
@@ -185,6 +187,42 @@ function isRetryableError(error) {
 
 function log(...args) {
     if (getSettings().debugMode) console.log(LOG_PREFIX, ...args);
+}
+
+function trace(...args) {
+    const s = getSettings();
+    if (s.debugMode && s.traceMode) {
+        const normalized = args.map((arg, idx) => (idx === 0 && typeof arg === 'string')
+            ? arg.toUpperCase()
+            : arg);
+        console.log(LOG_PREFIX, '[TRACE]', ...normalized);
+    }
+}
+
+function debugVisibleTurns(chat, store) {
+    trace('=== DEBUG VISIBLE TURNS ===');
+    trace('  store.summarizedUpTo:', store.summarizedUpTo);
+    trace('  Total chat messages:', chat.length);
+
+    let visibleCount = 0;
+    let ghostedCount = 0;
+    let hiddenCount = 0;
+    let visibleIndices = [];
+
+    for (let i = 0; i < chat.length; i++) {
+        const m = chat[i];
+        if (!m.is_user && !m.is_system && !m.extra?.sc_ghosted && m.mes?.trim()?.length > 0) {
+            visibleCount++;
+            visibleIndices.push(i);
+        }
+        if (m.extra?.sc_ghosted) ghostedCount++;
+        if (m.is_hidden || m.is_system) hiddenCount++;
+    }
+
+    trace('  Visible assistant turns:', visibleCount, visibleIndices);
+    trace('  Ghosted messages:', ghostedCount);
+    trace('  Hidden/system messages:', hiddenCount);
+    trace('===========================');
 }
 
 function resolvePromptMacros(text) {
@@ -1501,6 +1539,7 @@ function updateUI() {
 
         $('#sc_prompt_preset').val(s.promptPreset);
         $('#sc_debug_mode').prop('checked', s.debugMode);
+        $('#sc_trace_mode').prop('checked', s.traceMode);
         $('#sc_strip_patterns').val((s.stripPatterns || []).join('\n'));
         $('#sc_summarizer_response_length').val(s.summarizerResponseLength || 0);
 
@@ -1846,6 +1885,11 @@ function bindUIEvents() {
         saveSettings();
     });
 
+    $('#sc_trace_mode').on('change', function () {
+        getSettings().traceMode = $(this).prop('checked');
+        saveSettings();
+    });
+
     $('#sc_resolve_native_macros').on('change', function () {
         getSettings().resolveNativeMacros = $(this).prop('checked');
         saveSettings();
@@ -1917,6 +1961,7 @@ function bindUIEvents() {
         let revealed = 0;
         btn.prop('disabled', true);
         try {
+            debugVisibleTurns(chat, store);
             for (const idx of toReveal) {
                 if (idx < 0 || idx >= chat.length) continue;
                 const msg = chat[idx];
