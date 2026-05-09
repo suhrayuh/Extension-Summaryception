@@ -256,9 +256,22 @@ function getTotalPrunedCount(store) {
     return Number(store?.prunedSnippetCount || 0);
 }
 
-function estimateTokenCount(text) {
+function estimateTokenCount(text, padding = 0) {
     const normalized = String(text || '').trim();
     if (!normalized) return 0;
+
+    try {
+        const ctx = SillyTavern.getContext();
+        if (typeof ctx.getTokenCount === 'function') {
+            const counted = ctx.getTokenCount(normalized, padding);
+            if (Number.isFinite(counted) && counted >= 0) {
+                return counted;
+            }
+        }
+    } catch (e) {
+        log('Real token counter unavailable, falling back to heuristic estimate:', e);
+    }
+
     return Math.max(1, Math.ceil(normalized.length / 4));
 }
 
