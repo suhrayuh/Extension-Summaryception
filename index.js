@@ -1582,6 +1582,7 @@ function updateUI() {
         $('#sc_resolve_native_macros').prop('checked', s.resolveNativeMacros);
         $('#sc_strip_trackers').prop('checked', s.stripTrackers !== false);
         $('#sc_retention_mode').val(s.retentionMode || 'preserve');
+        $('#sc_max_injection_tokens').val(s.maxInjectionTokens || 0);
         $('#sc_injection_template').val(s.injectionTemplate);
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
