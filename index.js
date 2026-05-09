@@ -262,6 +262,38 @@ function estimateTokenCount(text) {
     return Math.max(1, Math.ceil(normalized.length / 4));
 }
 
+function splitIntoSentences(text) {
+    const normalized = String(text || '').trim();
+    if (!normalized) return [];
+
+    const parts = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g);
+    return (parts && parts.length > 0 ? parts : [normalized]).map(part => part.trim()).filter(Boolean);
+}
+
+function estimateSentenceFit(text, remainingTokens) {
+    const sentences = splitIntoSentences(text);
+    if (sentences.length === 0) return '';
+    if (!remainingTokens || remainingTokens <= 0) return '';
+
+    let built = '';
+    let used = 0;
+
+    for (const sentence of sentences) {
+        const next = built ? `${built} ${sentence}` : sentence;
+        const cost = estimateTokenCount(next);
+        if (cost > remainingTokens) break;
+        built = next;
+        used = cost;
+    }
+
+    if (built) return built;
+
+    // Last resort: if even the first sentence is too large, try trimming the text.
+    const firstSentence = sentences[0];
+    const approxChars = Math.max(1, remainingTokens * 4);
+    return firstSentence.length <= approxChars ? firstSentence : firstSentence.slice(0, approxChars).trim();
+}
+
 function getSettings() {
     const { extensionSettings } = SillyTavern.getContext();
     if (!extensionSettings[MODULE_NAME]) {
@@ -1395,19 +1427,23 @@ function selectSnippetsForInjection(candidates, maxTokens) {
 
     for (const candidate of candidates) {
         const cost = candidate.tokenEstimate || estimateTokenCount(candidate.text);
+        const remaining = maxTokens - used;
 
-        // Always allow at least one full snippet so nothing gets cut mid-thought.
-        if (selected.length === 0 && cost > maxTokens) {
+        if (remaining <= 0) break;
+
+        if (cost <= remaining) {
             selected.push(candidate.text);
-            break;
+            used += cost;
+            continue;
         }
 
-        if (selected.length > 0 && used + cost > maxTokens) {
-            break;
+        const partial = estimateSentenceFit(candidate.text, remaining);
+        if (partial && partial.trim()) {
+            selected.push(partial.trim());
+            used += estimateTokenCount(partial);
         }
 
-        selected.push(candidate.text);
-        used += cost;
+        break;
     }
 
     return selected.reverse();
