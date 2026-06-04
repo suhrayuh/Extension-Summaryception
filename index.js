@@ -290,28 +290,24 @@ function estimateSentenceFit(text, remainingTokens) {
     if (!remainingTokens || remainingTokens <= 0) return '';
 
     // Keep the newest contiguous fitting suffix from the snippet.
-    // Start with the very last sentence, then prepend earlier ones only while the
-    // entire suffix still fits. Do not skip the latest sentence in favor of older ones.
+    // Start with the very last sentence, then prepend earlier ones while the
+    // suffix still fits. When the next older sentence would overflow the budget,
+    // include that full sentence anyway and stop there rather than truncating.
     const lastSentence = sentences[sentences.length - 1];
-    if (estimateTokenCount(lastSentence) > remainingTokens) {
-        const approxChars = Math.max(1, remainingTokens * 4);
-        return lastSentence.length <= approxChars ? lastSentence : lastSentence.slice(-approxChars).trim();
-    }
+    if (estimateTokenCount(lastSentence) > remainingTokens) return lastSentence;
 
     let selected = [lastSentence];
 
     for (let i = sentences.length - 2; i >= 0; i--) {
         const candidate = [sentences[i], ...selected].join(' ');
         const cost = estimateTokenCount(candidate);
-        if (cost > remainingTokens) break;
+        if (cost > remainingTokens) return candidate;
         selected.unshift(sentences[i]);
     }
 
     if (selected.length > 0) return selected.join(' ');
 
-    // Last resort: if even the last sentence is too large, keep the tail of it.
-    const approxChars = Math.max(1, remainingTokens * 4);
-    return lastSentence.length <= approxChars ? lastSentence : lastSentence.slice(-approxChars).trim();
+    return lastSentence;
 }
 
 function getSettings() {
