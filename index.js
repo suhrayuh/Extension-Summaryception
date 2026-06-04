@@ -200,7 +200,7 @@ function trace(...args) {
 }
 
 function debugVisibleTurns(chat, store) {
-    trace('=== DEBUG VISIBLE TURNS ===');
+    trace('=== DEBUG VISIBLE MESSAGES ===');
     trace('  store.summarizedUpTo:', store.summarizedUpTo);
     trace('  Total chat messages:', chat.length);
 
@@ -211,7 +211,7 @@ function debugVisibleTurns(chat, store) {
 
     for (let i = 0; i < chat.length; i++) {
         const m = chat[i];
-        if (!m.is_user && !m.is_system && !m.extra?.sc_ghosted && m.mes?.trim()?.length > 0) {
+        if (!m.is_system && !m.is_hidden && !m.extra?.sc_ghosted && m.mes?.trim()?.length > 0) {
             visibleCount++;
             visibleIndices.push(i);
         }
@@ -219,7 +219,7 @@ function debugVisibleTurns(chat, store) {
         if (m.is_hidden || m.is_system) hiddenCount++;
     }
 
-    trace('  Visible assistant turns:', visibleCount, visibleIndices);
+    trace('  Visible messages:', visibleCount, visibleIndices);
     trace('  Ghosted messages:', ghostedCount);
     trace('  Hidden/system messages:', hiddenCount);
     trace('===========================');
@@ -572,28 +572,29 @@ async function repairIfBranched() {
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
 
-function getAssistantTurns(chat) {
-    const turns = [];
+function getVisibleMessages(chat) {
+    const messages = [];
     for (let i = 0; i < chat.length; i++) {
         const m = chat[i];
         const isOurGhost = m.extra?.sc_ghosted === true;
-        const isAssistant = !m.is_user && (!m.is_system || isOurGhost);
-        if (isAssistant && m.mes && m.mes.trim().length > 0) {
-            turns.push({ index: i, mes: m.mes, name: m.name || 'Assistant' });
+        const isVisible = (m.is_user || (!m.is_system || isOurGhost)) && !m.is_hidden;
+        if (isVisible && m.mes && m.mes.trim().length > 0) {
+            messages.push({ index: i, mes: m.mes, name: m.name || (m.is_user ? 'Player' : 'Assistant') });
         }
     }
-    return turns;
+    return messages;
 }
 
-function getVisibleAssistantTurns(chat) {
-    const turns = [];
+function getVisibleUnghostedMessages(chat) {
+    const messages = [];
     for (let i = 0; i < chat.length; i++) {
         const m = chat[i];
-        if (!m.is_user && !m.is_system && !m.extra?.sc_ghosted && m.mes && m.mes.trim().length > 0) {
-            turns.push({ index: i, mes: m.mes, name: m.name || 'Assistant' });
+        if (m.is_system || m.is_hidden || m.extra?.sc_ghosted) continue;
+        if (m.mes && m.mes.trim().length > 0) {
+            messages.push({ index: i, mes: m.mes, name: m.name || (m.is_user ? 'Player' : 'Assistant') });
         }
     }
-    return turns;
+    return messages;
 }
 
 /**
@@ -951,14 +952,13 @@ async function maybeSummarizeTurns() {
     const { chat } = SillyTavern.getContext();
     const store = getChatStore();
 
-    const allAssistantTurns = getAssistantTurns(chat);
-    const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
+    const visibleMessages = getVisibleUnghostedMessages(chat);
 
-    log(`Visible assistant turns: ${visibleTurns.length}, limit: ${s.verbatimTurns}`);
+    log(`Visible messages: ${visibleMessages.length}, limit: ${s.verbatimTurns}`);
 
-    if (visibleTurns.length <= s.verbatimTurns) return;
+    if (visibleMessages.length <= s.verbatimTurns) return;
 
-    const overflow = visibleTurns.length - s.verbatimTurns;
+    const overflow = visibleMessages.length - s.verbatimTurns;
 
     // ─── Backlog detection ───────────────────────────────────────
     const backlogThreshold = s.turnsPerSummary * 2;
@@ -970,7 +970,7 @@ async function maybeSummarizeTurns() {
         const choice = await showCatchupDialog(overflow, batchesNeeded);
 
         if (choice === 'skip') {
-            const cutoff = visibleTurns[visibleTurns.length - s.verbatimTurns - 1];
+            const cutoff = visibleMessages[visibleMessages.length - s.verbatimTurns - 1];
             if (cutoff) {
                 store.summarizedUpTo = cutoff.index;
                 log(`Skipped backlog. summarizedUpTo set to ${store.summarizedUpTo}`);
@@ -979,24 +979,24 @@ async function maybeSummarizeTurns() {
             await saveChatStore();
             return;
         } else if (choice === 'catchup') {
-            await runCatchup(visibleTurns, overflow);
+            await runCatchup(visibleMessages, overflow);
             return;
         } else if (choice === 'partial') {
-            await summarizeOneBatch(visibleTurns);
+            await summarizeOneBatch(visibleMessages);
             return;
         }
         return;
     }
 
     // ─── Normal operation: single batch ──────────────────────────
-    const success = await summarizeOneBatch(visibleTurns);
+    const success = await summarizeOneBatch(visibleMessages);
 
     if (!success) {
         log('Batch failed, stopping summarization cycle to avoid retry loop.');
         return;
     }
 
-    const remaining = getAssistantTurns(chat).filter(t => !chat[t.index].extra?.sc_ghosted);
+    const remaining = getVisibleUnghostedMessages(chat);
     if (remaining.length > s.verbatimTurns && remaining.length - s.verbatimTurns <= backlogThreshold) {
         await maybeSummarizeTurns();
     }
@@ -1020,7 +1020,7 @@ async function summarizeOneBatch(visibleTurns) {
         const startIdx = batch[0].index;
         const endIdx = batch[batch.length - 1].index;
 
-        log(`Summarizing ${batch.length} assistant turns (indices ${startIdx}–${endIdx})`);
+        log(`Summarizing ${batch.length} messages (indices ${startIdx}–${endIdx})`);
 
         if (!store.layers[0]) store.layers[0] = [];
         const passageStart = store.summarizedUpTo < 0 ? 0 : store.summarizedUpTo + 1;
@@ -1195,8 +1195,7 @@ async function runCatchup(visibleTurns, overflow) {
 
         while (!cancelled) {
             const { chat } = SillyTavern.getContext();
-            const allAssistantTurns = getAssistantTurns(chat);
-            const currentVisible = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
+            const currentVisible = getVisibleUnghostedMessages(chat);
 
             if (currentVisible.length <= s.verbatimTurns) break;
 
@@ -1269,7 +1268,7 @@ async function showCatchupDialog(overflowCount, estimatedCalls) {
         <div class="sc-catchup-modal">
         <h3>🧠 Summaryception — Backlog Detected</h3>
         <div class="sc-catchup-dialog">
-        <p>Summaryception detected <strong>${overflowCount} unsummarized turns</strong>
+        <p>Summaryception detected <strong>${overflowCount} unsummarized messages</strong>
         in this chat (beyond your ${s.verbatimTurns} verbatim limit).</p>
         <p>This will require approximately <strong>${estimatedCalls} summarizer calls</strong> to process.</p>
         <hr>
@@ -1278,7 +1277,7 @@ async function showCatchupDialog(overflowCount, estimatedCalls) {
         <i class="fa-solid fa-forward-fast"></i>
         <div class="sc-btn-text">
         <span class="sc-btn-label">Process Entire Backlog</span>
-        <span class="sc-btn-desc">Summarize all ${overflowCount} turns — cancelable at any time</span>
+        <span class="sc-btn-desc">Summarize all ${overflowCount} messages — cancelable at any time</span>
         </div>
         </button>
         <button id="sc_catchup_skip" class="menu_button">
@@ -1292,7 +1291,7 @@ async function showCatchupDialog(overflowCount, estimatedCalls) {
         <i class="fa-solid fa-play"></i>
         <div class="sc-btn-text">
         <span class="sc-btn-label">Just One Batch</span>
-        <span class="sc-btn-desc">Summarize ${s.turnsPerSummary} turns now, deal with the rest later</span>
+        <span class="sc-btn-desc">Summarize ${s.turnsPerSummary} messages now, deal with the rest later</span>
         </div>
         </button>
         </div>
@@ -1493,7 +1492,7 @@ function updateInjection() {
             return;
         }
 
-        const depth = s.verbatimTurns * 2;
+        const depth = s.verbatimTurns;
         setExtensionPrompt(MODULE_NAME, summaryBlock, 1, depth, false, 0);
 
         log(`Injection updated: ${summaryBlock.length} chars at depth ${depth}`);
@@ -1508,8 +1507,8 @@ function onMessageReceived(messageIndex) {
     try {
         const { chat } = SillyTavern.getContext();
         const msg = chat[messageIndex];
-        if (msg && !msg.is_user && !msg.is_system) {
-            log('New assistant message at index', messageIndex);
+        if (msg && msg.mes && msg.mes.trim().length > 0) {
+            log('New message at index', messageIndex);
             setTimeout(async () => {
                 await maybeSummarizeTurns();
                 updateInjection();
@@ -2220,18 +2219,17 @@ function bindUIEvents() {
             catchupDismissed = false;
 
             const { chat } = SillyTavern.getContext();
-            const allAssistantTurns = getAssistantTurns(chat);
-            const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
+            const visibleMessages = getVisibleUnghostedMessages(chat);
 
-            if (visibleTurns.length <= s.verbatimTurns) {
-                toastr.info('Nothing to summarize — visible turns are within the verbatim limit.', 'Summaryception');
+            if (visibleMessages.length <= s.verbatimTurns) {
+                toastr.info('Nothing to summarize — visible messages are within the verbatim limit.', 'Summaryception');
                 return;
             }
 
-            const overflow = visibleTurns.length - s.verbatimTurns;
-            toastr.info(`${overflow} turns to process. Starting...`, 'Summaryception', { timeOut: 2000 });
+            const overflow = visibleMessages.length - s.verbatimTurns;
+            toastr.info(`${overflow} messages to process. Starting...`, 'Summaryception', { timeOut: 2000 });
 
-            await runCatchup(visibleTurns, overflow);
+            await runCatchup(visibleMessages, overflow);
             updateInjection();
         } finally {
             $(this).prop('disabled', false).html('<i class="fa-solid fa-bolt"></i> Force Summarize Now');
