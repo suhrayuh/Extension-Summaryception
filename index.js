@@ -384,11 +384,29 @@ async function reconcileGhostedState() {
 
     if (!Array.isArray(chat) || chat.length === 0) return false;
 
-    const layerZero = Array.isArray(store.layers?.[0]) ? store.layers[0] : [];
-    const validRanges = layerZero
-        .filter(sn => Array.isArray(sn.turnRange) && Number.isInteger(sn.turnRange[0]) && Number.isInteger(sn.turnRange[1]))
-        .map(sn => ({ start: sn.turnRange[0], end: sn.turnRange[1] }))
-        .sort((a, b) => a.start - b.start);
+    // Coverage comes from ALL layers, not just Layer 0:
+    //   - Layer 0 snippets have turnRange (the message range they summarize)
+    //   - Layer 1+ merged snippets have coveredRanges (union of merged snippets' turnRanges)
+    //   - Seed snippets preserve their original turnRange via the splice path
+    // Without this, promotion would shrink Layer 0's coverage and the reconciler
+    // would unhide messages that are still covered by a higher layer.
+    const allRanges = [];
+    for (const layer of (Array.isArray(store.layers) ? store.layers : [])) {
+        if (!Array.isArray(layer)) continue;
+        for (const sn of layer) {
+            if (Array.isArray(sn.turnRange) && Number.isInteger(sn.turnRange[0]) && Number.isInteger(sn.turnRange[1])) {
+                allRanges.push({ start: sn.turnRange[0], end: sn.turnRange[1] });
+            }
+            if (Array.isArray(sn.coveredRanges)) {
+                for (const r of sn.coveredRanges) {
+                    if (Array.isArray(r) && Number.isInteger(r[0]) && Number.isInteger(r[1])) {
+                        allRanges.push({ start: r[0], end: r[1] });
+                    }
+                }
+            }
+        }
+    }
+    const validRanges = allRanges.sort((a, b) => a.start - b.start);
 
     const coveredIndices = new Set();
     for (const range of validRanges) {
@@ -449,7 +467,7 @@ async function reconcileGhostedState() {
     }
 
     if (changed) {
-        log(`Reconciled Summaryception state. summarizedUpTo=${store.summarizedUpTo}, ghosted=${store.ghostedIndices.length}, layer0=${layerZero.length}`);
+        log(`Reconciled Summaryception state. summarizedUpTo=${store.summarizedUpTo}, ghosted=${store.ghostedIndices.length}, coverageRanges=${validRanges.length}`);
         await saveChatStore();
         try {
             const ctx = SillyTavern.getContext();
@@ -560,7 +578,7 @@ async function ghostMessagesUpTo(endIndex) {
     const store = getChatStore();
 
     const progressToast = toastr.info(
-        `Hiding messages: 0 / ${endIndex + 1}`,
+        `Verifying ghosted state up to message ${endIndex}…`,
         'Summaryception — Ghosting',
         {
             timeOut: 0,
@@ -1504,10 +1522,15 @@ async function maybePromoteLayer(layerIndex, options = {}) {
         return;
     }
 
+    const coveredRanges = toMerge
+        .filter(sn => Array.isArray(sn.turnRange) && Number.isInteger(sn.turnRange[0]) && Number.isInteger(sn.turnRange[1]))
+        .map(sn => [sn.turnRange[0], sn.turnRange[1]]);
+
     destLayer.push({
         text: metaSummary,
         fromLayer: layerIndex,
         mergedCount: toMerge.length,
+        coveredRanges,
         timestamp: Date.now(),
     });
 
