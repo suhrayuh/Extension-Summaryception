@@ -378,11 +378,101 @@ async function saveChatStore() {
     await SillyTavern.getContext().saveMetadata();
 }
 
+function computeAllCoveredIndices(store, chatLength) {
+    const covered = new Set();
+    if (!Array.isArray(store.layers)) return covered;
+    for (const layer of store.layers) {
+        if (!Array.isArray(layer)) continue;
+        for (const sn of layer) {
+            if (Array.isArray(sn.turnRange) && Number.isInteger(sn.turnRange[0]) && Number.isInteger(sn.turnRange[1])) {
+                for (let i = sn.turnRange[0]; i <= sn.turnRange[1] && i < chatLength; i++) {
+                    covered.add(i);
+                }
+            }
+            if (Array.isArray(sn.coveredRanges)) {
+                for (const r of sn.coveredRanges) {
+                    if (Array.isArray(r) && Number.isInteger(r[0]) && Number.isInteger(r[1])) {
+                        for (let i = r[0]; i <= r[1] && i < chatLength; i++) {
+                            covered.add(i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return covered;
+}
+
+function backfillLegacyCoverage(store, chatLength) {
+    if (store.coverageBackfilledAt) return false;
+    if (!Array.isArray(store.layers) || store.layers.length < 2) return false;
+
+    let didWork = false;
+    const trusted = computeAllCoveredIndices(store, chatLength);
+
+    const legacyEntries = [];
+    for (let i = 1; i < store.layers.length; i++) {
+        const layer = store.layers[i];
+        if (!Array.isArray(layer)) continue;
+        for (const sn of layer) {
+            if (sn && !Array.isArray(sn.coveredRanges) && sn.mergedCount && !sn.turnRange) {
+                legacyEntries.push(sn);
+            }
+        }
+    }
+
+    if (legacyEntries.length === 0) {
+        store.coverageBackfilledAt = Date.now();
+        return true;
+    }
+
+    const maxCovered = store.summarizedUpTo ?? -1;
+    if (maxCovered < 0) {
+        store.coverageBackfilledAt = Date.now();
+        return true;
+    }
+
+    const inferred = new Set();
+    for (let i = 0; i <= maxCovered && i < chatLength; i++) {
+        if (!trusted.has(i)) inferred.add(i);
+    }
+
+    legacyEntries.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    const sortedInferred = [...inferred].sort((a, b) => a - b);
+    let cursor = 0;
+
+    for (const sn of legacyEntries) {
+        // Fallback size assumption: each merged snippet covered 3 turns if we don't know
+        const expectedSize = sn.mergedCount * 3;
+        const slice = sortedInferred.slice(cursor, cursor + expectedSize);
+        if (slice.length > 0) {
+            const min = slice[0];
+            const max = slice[slice.length - 1];
+            sn.coveredRanges = [[min, max]];
+            cursor += slice.length;
+            didWork = true;
+            log(`Backfill: legacy merged entry assigned coveredRanges=[[${min}, ${max}]] (inferred from chat state)`);
+        } else {
+            log(`Backfill: legacy merged entry could not be assigned coverage (no inferred gaps left).`);
+        }
+    }
+
+    store.coverageBackfilledAt = Date.now();
+    return didWork;
+}
+
 async function reconcileGhostedState() {
     const { chat } = SillyTavern.getContext();
     const store = getChatStore();
 
     if (!Array.isArray(chat) || chat.length === 0) return false;
+
+    // Run one-time backfill for legacy merged entries
+    if (!store.coverageBackfilledAt) {
+        if (backfillLegacyCoverage(store, chat.length)) {
+            await saveChatStore();
+        }
+    }
 
     // Coverage comes from ALL layers, not just Layer 0:
     //   - Layer 0 snippets have turnRange (the message range they summarize)
@@ -1672,6 +1762,13 @@ function onChatChanged() {
     catchupDismissed = false;
     temporarilyUnghostedIndices = [];
     setTimeout(async () => {
+        const store = getChatStore();
+        const { chat } = SillyTavern.getContext();
+        if (store && Array.isArray(chat) && !store.coverageBackfilledAt) {
+            if (backfillLegacyCoverage(store, chat.length)) {
+                await saveChatStore();
+            }
+        }
         await repairIfBranched();
         updateInjection();
         updateUI();
@@ -1883,7 +1980,8 @@ function updateUI() {
         let ghostedCount = 0;
         try {
             const { chat } = SillyTavern.getContext();
-            ghostedCount = chat.filter(m => m.extra?.sc_ghosted).length;
+            const covered = computeAllCoveredIndices(store, chat.length);
+            ghostedCount = covered.size;
         } catch (e) { /* no chat loaded */ }
 
         $('#sc_reveal_ghosted').html(
@@ -1945,12 +2043,26 @@ function updateSnippetBrowser() {
             html += `<div class="sc-browser-layer"><div class="sc-browser-layer-title">${label}</div>`;
             for (let j = 0; j < layer.length; j++) {
                 const sn = layer[j];
-                const rangeStr = sn.turnRange
-                ? `turns ${sn.turnRange[0]}–${sn.turnRange[1]}`
-                : sn.mergedCount
-                ? `merged ${sn.mergedCount} from L${sn.fromLayer}`
-                : '';
-                const seedStr = sn.promoted ? ' 🌱' : '';
+                let rangeStr = '';
+                if (sn.turnRange) {
+                    rangeStr = `turns ${sn.turnRange[0]}–${sn.turnRange[1]}`;
+                } else if (Array.isArray(sn.coveredRanges) && sn.coveredRanges.length > 0) {
+                    const minStart = Math.min(...sn.coveredRanges.map(r => r[0]));
+                    const maxEnd = Math.max(...sn.coveredRanges.map(r => r[1]));
+                    rangeStr = `merged ${sn.mergedCount || sn.coveredRanges.length} from L${sn.fromLayer} (turns ${minStart}–${maxEnd})`;
+                } else if (sn.mergedCount) {
+                    rangeStr = `merged ${sn.mergedCount} from L${sn.fromLayer}`;
+                }
+
+                let metaEmoji = ' 📝';
+                if (sn.promoted) {
+                    metaEmoji = ' 🌱';
+                } else if (i > 0 && sn.mergedCount) {
+                    metaEmoji = ' 🔗';
+                } else if (i === 0 && j === 0 && store.hasCreatedInitialSnippet) {
+                    metaEmoji = ' 🏁';
+                }
+
                 const canRedo = (i === 0 && sn.turnRange);
                 const redoBtn = canRedo
                 ? `<button class="sc-snippet-redo menu_button fa-solid fa-rotate-right" title="Regenerate this snippet"></button>`
@@ -1958,7 +2070,7 @@ function updateSnippetBrowser() {
 
                 html += `<div class="sc-snippet" data-layer="${i}" data-idx="${j}">
                 <span class="sc-snippet-text" data-layer="${i}" data-idx="${j}" title="Click to edit">${escapeHtml(sn.text)}</span>
-                <span class="sc-snippet-meta">${rangeStr}${seedStr}</span>
+                <span class="sc-snippet-meta">${rangeStr}${metaEmoji}</span>
                 ${redoBtn}
                 <button class="sc-snippet-delete menu_button fa-solid fa-xmark" title="Delete this snippet"></button>
                 </div>`;
