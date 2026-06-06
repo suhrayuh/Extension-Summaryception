@@ -327,7 +327,7 @@
                     <div class="sc-row">
                         <label for="sc_retention_mode">
                             <span>Deepest Layer Retention Mode</span>
-                            <small class="sc-hint">Choose what happens when the deepest allowed layer exceeds its snippet limit and cannot promote any further.</small>
+                            <small class="sc-hint">Choose what happens when the deepest allowed layer exceeds its snippet limit and cannot promote any further. <strong>Preserve</strong> (default) is the safe choice — storage is naturally bounded by layer promotion and no snippet data is ever lost. <strong>Drop oldest</strong> permanently deletes the oldest snippets to enforce a hard cap, and cannot be undone.</small>
                         </label>
                         <select id="sc_retention_mode" class="text_pole">
                             <option value="preserve">Preserve overflow (original behavior)</option>
@@ -390,6 +390,24 @@
                             </small>
                         </label>
                         <textarea id="sc_first_snippet_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_meta_snippet_system_prompt">
+                            <span>Meta-Snippet (Promotion) System Prompt</span>
+                            <small class="sc-hint">Used only for layer promotion calls, replacing the regular summarizer system prompt for those requests. The system prompt establishes the LLM's role; the user prompt contains the actual variables.</small>
+                        </label>
+                        <textarea id="sc_meta_snippet_system_prompt" class="text_pole sc-textarea" rows="3"></textarea>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_meta_snippet_user_prompt">
+                            <span>Meta-Snippet (Promotion) User Prompt</span>
+                            <small class="sc-hint">
+                                Used only for layer promotion calls, instead of the regular user prompt. Variables: <code>{{player_name}}</code> <code>{{context_str}}</code> <code>{{story_txt}}</code> (merged snippets joined with spaces) <code>{{snippet_count}}</code> (number of snippets being merged)
+                            </small>
+                        </label>
+                        <textarea id="sc_meta_snippet_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
                     </div>
 
                     <div class="sc-row">

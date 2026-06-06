@@ -16,6 +16,7 @@ import {
     populateProfileDropdown,
     getConnectionDisplayName,
 } from './connectionutil.js';
+import { ARGUMENT_TYPE, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
 
 const MODULE_NAME = 'summaryception';
 const INJECTION_PROMPT_KEY = '1_memory';
@@ -69,6 +70,26 @@ const defaultSettings = Object.freeze({
     After establishing that opening frame, preserve the most important concrete developments from the passage.
     Exclude trivial repetition, ornamental prose, and low-importance detail.
     Output must remain a single compact paragraph or line that is denser than prose but more scene-establishing than later snippets:`,
+
+    metaSnippetSystemPrompt:
+    'You are a precise narrative-state tracker merging several prior summary snippets into a higher-level meta-summary. The input you receive is already-condensed text, not raw dialogue — do not over-compress.',
+
+    metaSnippetUserPrompt:
+    `<player_name>{{player_name}}</player_name>
+    <prior_context>{{context_str}}</prior_context>
+    <passage_in_question>{{story_txt}}</passage_in_question>
+
+    You are merging {{snippet_count}} previously-summarized snippets from earlier in the conversation into a single coherent meta-summary. Your job is to preserve concrete details, not to compress further.
+
+    Focus on: character interactions, dialogue tone, and relationship dynamics; emotional beats and character motivations; atmosphere, mood, and sensory details that establish tone; narrative themes and subtext; names, places, and time references; plot developments and unresolved tensions; details that distinguish this moment from any other.
+
+    Crucially: do not collapse specific names, places, and events into vague abstractions. If a name, place, or concrete event appears in any input snippet, it must survive into the output.
+
+    Exclude: repetition of identical details across snippets; meta-commentary about the summarization process itself; vague thematic statements that have lost their referents.
+
+    Skip any input snippets that are empty, unclear, or lack significant content.
+
+    Output a compact paragraph — denser than prose, looser than a single line. Preserve specificity. No preamble, no commentary, no markdown.`,
 
     promptPreset: 'narrative',  // 'narrative' | 'gamestate' | 'custom'
     pauseSummarization: false,  // true = stop processing, keep injecting
@@ -890,11 +911,12 @@ function shouldUseFirstSnippetPrompt(store) {
     return !hasLayerZeroSnippet && !hasSummarizedHistory;
 }
 
-function buildSummarizerPrompt(template, storyTxt, contextStr) {
+function buildSummarizerPrompt(template, storyTxt, contextStr, snippetCount = 0) {
     let prompt = (template || '')
         .replace('{{player_name}}', getPlayerName())
         .replace('{{context_str}}', contextStr || '(none yet)')
-        .replace('{{story_txt}}', storyTxt);
+        .replace('{{story_txt}}', storyTxt)
+        .replace('{{snippet_count}}', String(snippetCount));
 
     if (getSettings().resolveNativeMacros) {
         prompt = resolvePromptMacros(prompt);
@@ -906,12 +928,13 @@ function buildSummarizerPrompt(template, storyTxt, contextStr) {
 async function callSummarizer(storyTxt, contextStr, options = {}) {
     const s = getSettings();
     const useFirstSnippetPrompt = Boolean(options.useFirstSnippetPrompt && s.firstSnippetEnabled);
-    const promptTemplate = useFirstSnippetPrompt ? s.firstSnippetUserPrompt : s.summarizerUserPrompt;
-    const systemPrompt = useFirstSnippetPrompt ? s.firstSnippetSystemPrompt : s.summarizerSystemPrompt;
-    const prompt = buildSummarizerPrompt(promptTemplate, storyTxt, contextStr);
+    const useMetaSnippetPrompt = Boolean(options.useMetaSnippetPrompt);
+    const promptTemplate = useFirstSnippetPrompt ? s.firstSnippetUserPrompt : (useMetaSnippetPrompt ? s.metaSnippetUserPrompt : s.summarizerUserPrompt);
+    const systemPrompt = useFirstSnippetPrompt ? s.firstSnippetSystemPrompt : (useMetaSnippetPrompt ? s.metaSnippetSystemPrompt : s.summarizerSystemPrompt);
+    const prompt = buildSummarizerPrompt(promptTemplate, storyTxt, contextStr, options.snippetCount);
 
     log('── Summarizer Call ──');
-    log('Mode:', useFirstSnippetPrompt ? 'first-snippet' : 'default');
+    log('Mode:', useFirstSnippetPrompt ? 'first-snippet' : (useMetaSnippetPrompt ? 'meta-snippet' : 'default'));
     log('Context str length:', contextStr.length, 'chars');
     log('Story txt length:', storyTxt.length, 'chars');
 
@@ -1406,12 +1429,13 @@ async function showCatchupDialog(overflowCount, estimatedCalls) {
 
 // ─── Core: Layer Promotion ("ception") ──────────────────────────────
 
-async function maybePromoteLayer(layerIndex) {
+async function maybePromoteLayer(layerIndex, options = {}) {
     const s = getSettings();
     const store = getChatStore();
 
     const layer = store.layers[layerIndex];
-    if (!layer || layer.length <= s.snippetsPerLayer) return;
+    if (!layer) return;
+    if (!options.force && layer.length <= s.snippetsPerLayer) return;
 
     if (layerIndex >= s.maxLayers - 1) {
         if (s.retentionMode === 'drop_oldest') {
@@ -1459,7 +1483,9 @@ async function maybePromoteLayer(layerIndex) {
         return;
     }
 
-    const toMerge = layer.splice(0, s.snippetsPerPromotion);
+    const mergeCount = Math.max(1, options.count ?? s.snippetsPerPromotion);
+    const toMerge = layer.splice(0, Math.min(mergeCount, layer.length));
+    if (toMerge.length === 0) return;
     const storyTxt = toMerge.map(sn => sn.text).join(' ');
     const contextStr = buildFullContext(layerIndex + 1);
 
@@ -1469,7 +1495,10 @@ async function maybePromoteLayer(layerIndex) {
         { timeOut: 3000, progressBar: true }
     );
 
-    const metaSummary = await callSummarizer(storyTxt, contextStr);
+    const metaSummary = await callSummarizer(storyTxt, contextStr, {
+        useMetaSnippetPrompt: true,
+        snippetCount: toMerge.length,
+    });
     if (!metaSummary) {
         layer.unshift(...toMerge);
         return;
@@ -1585,8 +1614,9 @@ function updateInjection() {
             return;
         }
 
-        const { chat } = SillyTavern.getContext();
-        const depth = getVisibleUnghostedMessages(chat).length;
+        // Inject at a high static depth so it always clamps to the very end of the active
+        // chat history slice (before the oldest unghosted message), avoiding counting mismatches.
+        const depth = 999;
         setExtensionPrompt(INJECTION_PROMPT_KEY, summaryBlock, 1, depth, false, 0);
 
         log(`Injection updated: ${summaryBlock.length} chars at depth ${depth}`);
@@ -1696,6 +1726,76 @@ function registerSlashCommands() {
             },
             helpString: 'Preview the summary block that would be injected',
         }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'sc-promote',
+            callback: async (args) => {
+                const layerIdx = parseInt(args.layer ?? '0', 10);
+                if (Number.isNaN(layerIdx) || layerIdx < 0) {
+                    return `Invalid layer index: ${args.layer}`;
+                }
+                const s = getSettings();
+                const store = getChatStore();
+                const layer = store.layers[layerIdx];
+                if (!layer || layer.length === 0) {
+                    return `Layer ${layerIdx} is empty, nothing to promote.`;
+                }
+
+                const destExists = Array.isArray(store.layers[layerIdx + 1]) && store.layers[layerIdx + 1].length > 0;
+                const destIsEmpty = !destExists;
+                const beforeDestLen = destExists ? store.layers[layerIdx + 1].length : 0;
+                const beforeSrcLen = layer.length;
+
+                const countOpt = args.count != null ? parseInt(args.count, 10) : null;
+                if (countOpt !== null && (Number.isNaN(countOpt) || countOpt < 1)) {
+                    return `Invalid count: ${args.count}`;
+                }
+                const forceOpt = args.force != null ? String(args.force) === 'true' : true;
+
+                const requestedMerge = countOpt ?? s.snippetsPerPromotion;
+
+                await maybePromoteLayer(layerIdx, { force: forceOpt, count: countOpt ?? undefined });
+
+                await saveChatStore();
+                try {
+                    const ctx = SillyTavern.getContext();
+                    if (ctx.saveChat) await ctx.saveChat();
+                } catch (e) {
+                    log('Could not save chat:', e);
+                }
+                updateInjection();
+                updateUI();
+
+                if (destIsEmpty) {
+                    return `Seeded Layer ${layerIdx + 1} with oldest snippet from Layer ${layerIdx} (no LLM call). Source layer now has ${layer.length} snippet(s). Run /sc-promote again to trigger the actual meta-merge.`;
+                }
+                const afterDestLen = (store.layers[layerIdx + 1] || []).length;
+                if (afterDestLen > beforeDestLen) {
+                    return `Merged up to ${requestedMerge} snippet(s) from Layer ${layerIdx} into Layer ${layerIdx + 1} (now ${afterDestLen} entries; Layer ${layerIdx} has ${layer.length} remaining).`;
+                }
+                return `No merge produced for Layer ${layerIdx}. The layer may be at max depth, the LLM call may have failed, or the source layer had no snippets to merge. Check the Summaryception status panel.`;
+            },
+            namedArgumentList: [
+                SlashCommandNamedArgument.fromProps({
+                    name: 'layer',
+                    description: 'Source layer index to promote from (default 0)',
+                    typeList: [ARGUMENT_TYPE.NUMBER],
+                    defaultValue: '0',
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: 'count',
+                    description: 'Number of snippets to merge (default = settings.snippetsPerPromotion). Ignored when destination layer is empty (seed path runs instead).',
+                    typeList: [ARGUMENT_TYPE.NUMBER],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: 'force',
+                    description: 'Skip the overflow-capacity check (default true). Set false to mimic normal promotion behavior.',
+                    typeList: [ARGUMENT_TYPE.BOOLEAN],
+                    defaultValue: 'true',
+                }),
+            ],
+            helpString: 'Force-promote snippets from a layer to the next higher layer. Bypasses the overflow check by default. Use after changing the meta-prompt to re-merge with the new wording without waiting for the layer to fill up. The first call on an empty destination layer just seeds it (no LLM call); call again to trigger the meta-merge.',
+        }));
     } catch (e) {
         log('Could not register slash commands:', e);
     }
@@ -1730,6 +1830,8 @@ function updateUI() {
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
         $('#sc_first_snippet_system_prompt').val(s.firstSnippetSystemPrompt);
         $('#sc_first_snippet_user_prompt').val(s.firstSnippetUserPrompt);
+        $('#sc_meta_snippet_system_prompt').val(s.metaSnippetSystemPrompt);
+        $('#sc_meta_snippet_user_prompt').val(s.metaSnippetUserPrompt);
         // ── Prompt preset migration & sync ──
         // Migration: existing users with the old game-state default get upgraded to narrative.
         // Users who customized their prompt get marked as 'custom'.
@@ -2083,6 +2185,8 @@ function bindUIEvents() {
         { id: '#sc_summarizer_system_prompt', key: 'summarizerSystemPrompt' },
         { id: '#sc_first_snippet_system_prompt', key: 'firstSnippetSystemPrompt' },
         { id: '#sc_first_snippet_user_prompt', key: 'firstSnippetUserPrompt' },
+        { id: '#sc_meta_snippet_system_prompt', key: 'metaSnippetSystemPrompt' },
+        { id: '#sc_meta_snippet_user_prompt', key: 'metaSnippetUserPrompt' },
     ];
 
     for (const ta of textareas) {

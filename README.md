@@ -266,7 +266,7 @@ Summaryception can use different backends for summarization, independent of your
 - **Force Summarize** — Manually trigger summarization
 - **Stop** — Abort any running summarization, progress saved
 - **Repair** — Find and fix orphaned hidden messages
-- **Slash Commands** — `/sc-status`, `/sc-preview`, `/sc-clear`
+- **Slash Commands** — `/sc-status`, `/sc-preview`, `/sc-clear`, `/sc-promote`
 
 ---
 
