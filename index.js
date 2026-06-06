@@ -998,6 +998,29 @@ let isSummarizing = false;
 let catchupDismissed = false;
 let currentAbortController = null;
 let temporarilyUnghostedIndices = [];
+const snippetBrowserState = {
+    page: 1,
+    pageSize: 5,
+    sortOrder: 'desc', // 'desc' = start with newest, 'asc' = start with oldest
+};
+
+function getSnippetBounds(sn) {
+    if (Array.isArray(sn?.turnRange) && Number.isInteger(sn.turnRange[0]) && Number.isInteger(sn.turnRange[1])) {
+        return { start: sn.turnRange[0], end: sn.turnRange[1] };
+    }
+    if (Array.isArray(sn?.coveredRanges) && sn.coveredRanges.length > 0) {
+        const starts = sn.coveredRanges
+            .filter(r => Array.isArray(r) && Number.isInteger(r[0]) && Number.isInteger(r[1]))
+            .map(r => r[0]);
+        const ends = sn.coveredRanges
+            .filter(r => Array.isArray(r) && Number.isInteger(r[0]) && Number.isInteger(r[1]))
+            .map(r => r[1]);
+        if (starts.length > 0 && ends.length > 0) {
+            return { start: Math.min(...starts), end: Math.max(...ends) };
+        }
+    }
+    return null;
+}
 
 function abortSummarization() {
     if (currentAbortController) {
@@ -1761,6 +1784,7 @@ function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
     temporarilyUnghostedIndices = [];
+    snippetBrowserState.page = 1;
     setTimeout(async () => {
         const store = getChatStore();
         const { chat } = SillyTavern.getContext();
@@ -2033,53 +2057,141 @@ function updateSnippetBrowser() {
     const store = getChatStore();
     let html = '';
 
+    html += `<div class="sc-browser-controls" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding:0 5px;">
+    <label style="font-size:0.9em;cursor:pointer;display:flex;align-items:center;gap:5px;">
+    <input type="checkbox" id="sc_sort_toggle" ${snippetBrowserState.sortOrder === 'desc' ? 'checked' : ''}>
+    Start with Newest
+    </label>
+    </div>`;
+
     if (!store.layers || store.layers.every(l => !l || l.length === 0)) {
-        html = '<div class="sc-muted">No snippets to display.</div>';
+        html += '<div class="sc-muted">No snippets to display.</div>';
     } else {
+        const timeline = [];
         for (let i = store.layers.length - 1; i >= 0; i--) {
             const layer = store.layers[i];
             if (!layer || layer.length === 0) continue;
-            const label = i === 0 ? 'Layer 0 (Turn Summaries)' : `Layer ${i} (Meta-Summary)`;
-            html += `<div class="sc-browser-layer"><div class="sc-browser-layer-title">${label}</div>`;
             for (let j = 0; j < layer.length; j++) {
                 const sn = layer[j];
-                let rangeStr = '';
-                if (sn.turnRange) {
-                    rangeStr = `turns ${sn.turnRange[0]}–${sn.turnRange[1]}`;
-                } else if (Array.isArray(sn.coveredRanges) && sn.coveredRanges.length > 0) {
-                    const minStart = Math.min(...sn.coveredRanges.map(r => r[0]));
-                    const maxEnd = Math.max(...sn.coveredRanges.map(r => r[1]));
-                    rangeStr = `merged ${sn.mergedCount || sn.coveredRanges.length} from L${sn.fromLayer} (turns ${minStart}–${maxEnd})`;
-                } else if (sn.mergedCount) {
-                    rangeStr = `merged ${sn.mergedCount} from L${sn.fromLayer}`;
-                }
+                const bounds = getSnippetBounds(sn);
+                timeline.push({
+                    layerIdx: i,
+                    snippetIdx: j,
+                    snippet: sn,
+                    bounds,
+                    timestamp: sn?.timestamp || 0,
+                });
+            }
+        }
 
-                let metaEmoji = ' 📝';
-                if (sn.promoted) {
-                    metaEmoji = ' 🌱';
-                } else if (i > 0 && sn.mergedCount) {
-                    metaEmoji = ' 🔗';
-                } else if (i === 0 && j === 0 && store.hasCreatedInitialSnippet) {
-                    metaEmoji = ' 🏁';
-                }
+        timeline.sort((a, b) => {
+            const aHasBounds = Boolean(a.bounds);
+            const bHasBounds = Boolean(b.bounds);
+            if (aHasBounds && bHasBounds) {
+                if (a.bounds.start !== b.bounds.start) return a.bounds.start - b.bounds.start;
+                if (a.bounds.end !== b.bounds.end) return a.bounds.end - b.bounds.end;
+            } else if (aHasBounds !== bHasBounds) {
+                return aHasBounds ? -1 : 1;
+            }
+            if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+            if (a.layerIdx !== b.layerIdx) return b.layerIdx - a.layerIdx;
+            return a.snippetIdx - b.snippetIdx;
+        });
 
-                const canRedo = (i === 0 && sn.turnRange);
-                const redoBtn = canRedo
+        const totalItems = timeline.length;
+        const totalPages = Math.max(1, Math.ceil(totalItems / snippetBrowserState.pageSize));
+        snippetBrowserState.page = Math.max(1, Math.min(snippetBrowserState.page, totalPages));
+
+        const pagingOrder = snippetBrowserState.sortOrder === 'desc' ? [...timeline].reverse() : [...timeline];
+        const start = (snippetBrowserState.page - 1) * snippetBrowserState.pageSize;
+        const pageItems = pagingOrder.slice(start, start + snippetBrowserState.pageSize)
+            .sort((a, b) => {
+                const direction = snippetBrowserState.sortOrder === 'desc' ? -1 : 1;
+                if (a.bounds && b.bounds) {
+                    if (a.bounds.start !== b.bounds.start) return (a.bounds.start - b.bounds.start) * direction;
+                    if (a.bounds.end !== b.bounds.end) return (a.bounds.end - b.bounds.end) * direction;
+                } else if (Boolean(a.bounds) !== Boolean(b.bounds)) {
+                    return a.bounds ? -1 : 1;
+                }
+                if (a.timestamp !== b.timestamp) return (a.timestamp - b.timestamp) * direction;
+                if (a.layerIdx !== b.layerIdx) return (b.layerIdx - a.layerIdx) * direction;
+                return (a.snippetIdx - b.snippetIdx) * direction;
+            });
+
+        let activeLayer = null;
+        for (const item of pageItems) {
+            const { layerIdx, snippetIdx: j, snippet: sn, bounds } = item;
+            if (activeLayer !== layerIdx) {
+                if (activeLayer !== null) html += '</div>';
+                activeLayer = layerIdx;
+                const label = layerIdx === 0 ? 'Layer 0 (Turn Summaries)' : `Layer ${layerIdx} (Meta-Summary)`;
+                html += `<div class="sc-browser-layer"><div class="sc-browser-layer-title">${label}</div>`;
+            }
+
+            let rangeStr = '';
+            if (sn.turnRange) {
+                rangeStr = `turns ${sn.turnRange[0]}–${sn.turnRange[1]}`;
+            } else if (bounds) {
+                rangeStr = `merged ${sn.mergedCount || sn.coveredRanges.length} from L${sn.fromLayer} (turns ${bounds.start}–${bounds.end})`;
+            } else if (sn.mergedCount) {
+                rangeStr = `merged ${sn.mergedCount} from L${sn.fromLayer}`;
+            }
+
+            let metaEmoji = ' 📝';
+            if (sn.promoted) {
+                metaEmoji = ' 🌱';
+            } else if (layerIdx > 0 && sn.mergedCount) {
+                metaEmoji = ' 🔗';
+            } else if (layerIdx === 0 && j === 0 && store.hasCreatedInitialSnippet) {
+                metaEmoji = ' 🏁';
+            }
+
+            const canRedo = (layerIdx === 0 && sn.turnRange);
+            const redoBtn = canRedo
                 ? `<button class="sc-snippet-redo menu_button fa-solid fa-rotate-right" title="Regenerate this snippet"></button>`
                 : '';
 
-                html += `<div class="sc-snippet" data-layer="${i}" data-idx="${j}">
-                <span class="sc-snippet-text" data-layer="${i}" data-idx="${j}" title="Click to edit">${escapeHtml(sn.text)}</span>
-                <span class="sc-snippet-meta">${rangeStr}${metaEmoji}</span>
-                ${redoBtn}
-                <button class="sc-snippet-delete menu_button fa-solid fa-xmark" title="Delete this snippet"></button>
-                </div>`;
-            }
-            html += '</div>';
+            html += `<div class="sc-snippet" data-layer="${layerIdx}" data-idx="${j}">
+            <span class="sc-snippet-text" data-layer="${layerIdx}" data-idx="${j}" title="Click to edit">${escapeHtml(sn.text)}</span>
+            <span class="sc-snippet-meta">${rangeStr}${metaEmoji}</span>
+            ${redoBtn}
+            <button class="sc-snippet-delete menu_button fa-solid fa-xmark" title="Delete this snippet"></button>
+            </div>`;
+        }
+        if (activeLayer !== null) html += '</div>';
+
+        if (totalPages > 1) {
+            const atFirstPage = snippetBrowserState.page === 1;
+            const atLastPage = snippetBrowserState.page === totalPages;
+            const prevLabel = snippetBrowserState.sortOrder === 'desc' ? '◀ Newer' : '◀ Older';
+            const nextLabel = snippetBrowserState.sortOrder === 'desc' ? 'Older ▶' : 'Newer ▶';
+            html += `<div class="sc-pagination-bar" style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-size:0.9em;gap:8px;">
+            <button class="menu_button sc-page-prev" ${atFirstPage ? 'disabled' : ''} style="flex:1;">${prevLabel}</button>
+            <span style="flex:2;text-align:center;color:var(--SmartThemeBodyColor);">Page ${snippetBrowserState.page} of ${totalPages}</span>
+            <button class="menu_button sc-page-next" ${atLastPage ? 'disabled' : ''} style="flex:1;">${nextLabel}</button>
+            </div>`;
         }
     }
 
     $('#sc_snippet_browser').html(html);
+
+    $('#sc_sort_toggle').off('change').on('change', function () {
+        snippetBrowserState.sortOrder = this.checked ? 'desc' : 'asc';
+        snippetBrowserState.page = 1;
+        updateSnippetBrowser();
+    });
+
+    $('.sc-page-prev').off('click').on('click', function () {
+        if (snippetBrowserState.page > 1) {
+            snippetBrowserState.page--;
+            updateSnippetBrowser();
+        }
+    });
+
+    $('.sc-page-next').off('click').on('click', function () {
+        snippetBrowserState.page++;
+        updateSnippetBrowser();
+    });
 
     // Edit snippet on click
     $('.sc-snippet-text').off('click').on('click', function () {
