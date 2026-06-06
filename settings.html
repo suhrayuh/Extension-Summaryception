@@ -342,6 +342,14 @@
                         </label>
                         <input id="sc_max_injection_tokens" type="number" class="text_pole" min="0" step="250" value="0" placeholder="0 = unlimited" />
                     </div>
+
+                    <div class="sc-row">
+                        <label for="sc_snippets_per_page">
+                            <span>Snippet Browser Items Per Page</span>
+                            <small class="sc-hint">Controls how many snippets the browser renders at once. Lower values reduce UI lag in long chats.</small>
+                        </label>
+                        <input id="sc_snippets_per_page" type="number" class="text_pole" min="1" step="1" value="5" />
+                    </div>
  
                     <!-- Prompts -->
                     <h4 class="sc-section-title">✏️ Summarizer Prompts</h4>

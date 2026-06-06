@@ -35,6 +35,7 @@ const defaultSettings = Object.freeze({
     resolveNativeMacros: true,
     retentionMode: 'preserve',      // 'preserve' | 'drop_oldest'
     maxInjectionTokens: 0,          // 0 = unlimited, inject all snippets
+    snippetsPerPage: 5,
     injectionTemplate: '[Summary of past events: {{sc_snippets}}]',
     firstSnippetEnabled: true,
     stripTrackers: true,
@@ -1969,6 +1970,8 @@ function updateUI() {
         $('#sc_strip_trackers').prop('checked', s.stripTrackers !== false);
         $('#sc_retention_mode').val(s.retentionMode || 'preserve');
         $('#sc_max_injection_tokens').val(s.maxInjectionTokens || 0);
+        $('#sc_snippets_per_page').val(s.snippetsPerPage || 5);
+        snippetBrowserState.pageSize = Math.max(1, parseInt(s.snippetsPerPage, 10) || 5);
         $('#sc_injection_template').val(s.injectionTemplate);
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
@@ -2055,6 +2058,8 @@ function updateUI() {
 
 function updateSnippetBrowser() {
     const store = getChatStore();
+    const s = getSettings();
+    snippetBrowserState.pageSize = Math.max(1, parseInt(s.snippetsPerPage, 10) || 5);
     let html = '';
 
     html += `<div class="sc-browser-controls" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding:0 5px;">
@@ -2401,6 +2406,17 @@ function bindUIEvents() {
         $(this).val(nextValue);
         updateInjection();
         updateUI();
+    });
+
+    $('#sc_snippets_per_page').on('input', function () {
+        const nextValue = Math.max(1, parseInt($(this).val(), 10) || 5);
+        const s = getSettings();
+        s.snippetsPerPage = nextValue;
+        snippetBrowserState.pageSize = nextValue;
+        snippetBrowserState.page = 1;
+        saveSettings();
+        $(this).val(nextValue);
+        updateSnippetBrowser();
     });
 
     $('#sc_strip_patterns').on('change', function () {
