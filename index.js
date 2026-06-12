@@ -36,7 +36,7 @@ const defaultSettings = Object.freeze({
     retentionMode: 'preserve',      // 'preserve' | 'drop_oldest'
     maxInjectionTokens: 0,          // 0 = unlimited, inject all snippets
     snippetsPerPage: 5,
-    injectionTemplate: '[Summary of past events: {{sc_snippets}}]',
+    injectionTemplate: '[Summary of past events: {{summary}}]',
     firstSnippetEnabled: true,
     stripTrackers: true,
 
@@ -1726,7 +1726,7 @@ function assembleSummaryBlock() {
     const snippets = selectSnippetsForInjection(candidates, s.maxInjectionTokens || 0);
     if (snippets.length === 0) return '';
 
-    return s.injectionTemplate.replace('{{sc_snippets}}', snippets.join(' '));
+    return s.injectionTemplate.replace('{{summary}}', snippets.join(' '));
 }
 
 // ─── Injection via setExtensionPrompt ────────────────────────────────
