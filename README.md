@@ -16,8 +16,6 @@ This fork adds a small set of practical changes aimed at long-form SillyTavern r
   - Adds a `drop_oldest` mode so the deepest layer can stay within its configured capacity instead of preserving overflow forever.
 - **Token-budgeted recency injection**
   - Adds `maxInjectionTokens` so only the newest complete summary snippets that fit within a token budget are injected. In case maybe you don't want the *entirety* of your roleplay sent every turn, even if Summaryception is perfectly capable of doing that in a token-friendly manner.
-- **Safer internal injection placeholder**
-  - Renames Summaryception's internal wrapper placeholder from `{{summary}}` to `{{sc_snippets}}` to avoid collisions with SillyTavern's built-in summary macro.
 - **First-snippet protocol**
   - I noticed a problem where the first snippet in a chat is always super vague, not giving enough context as to who, what, when, where, and why for the beginning of the roleplay. So I implemented first-snippet protocol. When a chat has no prior summaries, the first Layer 0 snippet uses a dedicated scene-establishing prompt instead of the normal compact delta prompt. Both the system and user prompts for first-snippet mode are fully editable in the UI, and first-snippet protocol is an optional toggle. The flag resets automatically when you clear memory or delete all Layer 0 snippets.
 - **Temporary reveal / rehide ghosted messages**
