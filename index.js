@@ -1,5 +1,5 @@
 /**
- * Summaryception v5.3.3 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v5.3.4 — Layered Recursive Summarization for SillyTavern
  *
  * NON-DESTRUCTIVE: Uses SillyTavern's native /hide and /unhide commands
  * to exclude summarized messages from LLM context while keeping them
@@ -1412,7 +1412,11 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
 
 async function runCatchup(visibleTurns, overflow) {
     const s = getSettings();
-    const totalBatches = Math.ceil(overflow / s.turnsPerSummary);
+    // Use floor, not ceil: with the full-batch break condition below,
+    // straggler messages that don't fill a complete batch are left
+    // unsummarized until more arrive.  ceil would overcount and show
+    // a misleading "3 / 4 batches" at completion.
+    const totalBatches = Math.floor(overflow / s.turnsPerSummary);
     let completed = 0;
     let failed = 0;
     let cancelled = false;
@@ -1441,7 +1445,11 @@ async function runCatchup(visibleTurns, overflow) {
             const { chat } = SillyTavern.getContext();
             const currentVisible = getVisibleUnghostedMessages(chat);
 
-            if (currentVisible.length <= s.verbatimTurns) break;
+            // Only continue if there are enough visible messages to form a
+            // COMPLETE batch beyond the verbatim buffer.  This prevents
+            // creating tiny "straggler" snippets (e.g. a 1-message summary)
+            // when the leftover overflow is smaller than turnsPerSummary.
+            if (currentVisible.length < s.verbatimTurns + s.turnsPerSummary) break;
 
             const success = await summarizeOneBatchFromTurns(currentVisible);
 
